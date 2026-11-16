@@ -1,0 +1,797 @@
+diff --git a/include/linux/net.h b/include/linux/net.h
+index e2a866fbc..6917ea517 100644
+--- a/include/linux/net.h
++++ b/include/linux/net.h
+@@ -340,6 +340,8 @@ int sock_recvmsg(struct socket *sock, struct msghdr *msg, int flags);
+ struct file *sock_alloc_file(struct socket *sock, int flags, const char *dname);
+ struct socket *sockfd_lookup(int fd, int *err);
+ struct socket *sock_from_file(struct file *file);
++ssize_t sock_read_fast(struct file *file, char __user *buf, size_t count);
++ssize_t sock_write_fast(struct file *file, const char __user *buf, size_t count);
+ int sock_read_xattr(struct socket *sock, const char *name, void *value, size_t size);
+ #define		     sockfd_put(sock) fput(sock->file)
+ int net_ratelimit(void);
+diff --git a/include/linux/netlink.h b/include/linux/netlink.h
+index 882e9c1b6..13abe0768 100644
+--- a/include/linux/netlink.h
++++ b/include/linux/netlink.h
+@@ -357,5 +357,8 @@ bool netlink_ns_capable(const struct sk_buff *skb,
+ bool netlink_capable(const struct sk_buff *skb, int cap);
+ bool netlink_net_capable(const struct sk_buff *skb, int cap);
+ struct sk_buff *netlink_alloc_large_skb(unsigned int size, int broadcast);
++int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len);
++int netlink_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
++		    int flags);
+ 
+ #endif	/* __LINUX_NETLINK_H */
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index 69bb951b5..cd103dfc7 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -1836,7 +1836,7 @@ static void netlink_cmsg_listen_all_nsid(struct sock *sk, struct msghdr *msg,
+ 		 &NETLINK_CB(skb).nsid);
+ }
+ 
+-static int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
++int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ {
+ 	struct sock *sk = sock->sk;
+ 	struct netlink_sock *nlk = nlk_sk(sk);
+@@ -1925,8 +1925,8 @@ static int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ 	return err;
+ }
+ 
+-static int netlink_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+-			   int flags)
++int netlink_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
++		    int flags)
+ {
+ 	struct scm_cookie scm;
+ 	struct sock *sk = sock->sk;
+diff --git a/net/socket.c b/net/socket.c
+index 08658a9b8..b11a4f17b 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -99,6 +99,11 @@
+ #include <net/cls_cgroup.h>
+ 
+ #include <net/sock.h>
++#include <net/inet_connection_sock.h>
++#include <net/tcp.h>
++#include <net/udp.h>
++#include <net/rps.h>
++#include <net/af_unix.h>
+ #include <linux/netfilter.h>
+ 
+ #include <linux/if_tun.h>
+@@ -123,8 +128,7 @@ static ssize_t sock_write_iter(struct kiocb *iocb, struct iov_iter *from);
+ static int sock_mmap(struct file *file, struct vm_area_struct *vma);
+ 
+ static int sock_close(struct inode *inode, struct file *file);
+-static __poll_t sock_poll(struct file *file,
+-			      struct poll_table_struct *wait);
++__poll_t sock_poll(struct file *file, struct poll_table_struct *wait);
+ static long sock_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+ #ifdef CONFIG_COMPAT
+ static long compat_sock_ioctl(struct file *file,
+@@ -154,7 +158,7 @@ static void sock_show_fdinfo(struct seq_file *m, struct file *f)
+  *	in the operation structures but are done directly via the socketcall() multiplexor.
+  */
+ 
+-static const struct file_operations socket_file_ops = {
++const struct file_operations socket_file_ops = {
+ 	.owner =	THIS_MODULE,
+ 	.read_iter =	sock_read_iter,
+ 	.write_iter =	sock_write_iter,
+@@ -172,6 +176,7 @@ static const struct file_operations socket_file_ops = {
+ 	.splice_eof =	sock_splice_eof,
+ 	.show_fdinfo =	sock_show_fdinfo,
+ };
++EXPORT_SYMBOL(socket_file_ops);
+ 
+ static const char * const pf_family_names[] = {
+ 	[PF_UNSPEC]	= "PF_UNSPEC",
+@@ -788,6 +793,16 @@ INDIRECT_CALLABLE_DECLARE(int inet_sendmsg(struct socket *, struct msghdr *,
+ 					   size_t));
+ INDIRECT_CALLABLE_DECLARE(int inet6_sendmsg(struct socket *, struct msghdr *,
+ 					    size_t));
++#if IS_BUILTIN(CONFIG_UNIX)
++INDIRECT_CALLABLE_DECLARE(int unix_stream_sendmsg(struct socket *, struct msghdr *, size_t));
++INDIRECT_CALLABLE_DECLARE(int unix_dgram_sendmsg(struct socket *, struct msghdr *, size_t));
++INDIRECT_CALLABLE_DECLARE(int unix_stream_recvmsg(struct socket *, struct msghdr *, size_t, int));
++INDIRECT_CALLABLE_DECLARE(int unix_dgram_recvmsg(struct socket *, struct msghdr *, size_t, int));
++INDIRECT_CALLABLE_DECLARE(__poll_t unix_poll(struct file *, struct socket *, poll_table *));
++INDIRECT_CALLABLE_DECLARE(__poll_t unix_dgram_poll(struct file *, struct socket *, poll_table *));
++#endif
++INDIRECT_CALLABLE_DECLARE(int netlink_sendmsg(struct socket *, struct msghdr *, size_t));
++INDIRECT_CALLABLE_DECLARE(int netlink_recvmsg(struct socket *, struct msghdr *, size_t, int));
+ 
+ static noinline void call_trace_sock_send_length(struct sock *sk, int ret,
+ 						 int flags)
+@@ -797,9 +812,60 @@ static noinline void call_trace_sock_send_length(struct sock *sk, int ret,
+ 
+ static inline int sock_sendmsg_nosec(struct socket *sock, struct msghdr *msg)
+ {
+-	int ret = INDIRECT_CALL_INET(READ_ONCE(sock->ops)->sendmsg, inet6_sendmsg,
+-				     inet_sendmsg, sock, msg,
+-				     msg_data_left(msg));
++	int (*sendfn)(struct socket *, struct msghdr *, size_t) =
++		READ_ONCE(sock->ops)->sendmsg;
++	size_t size = msg_data_left(msg);
++	int ret;
++
++#if IS_BUILTIN(CONFIG_UNIX)
++	if (likely(sendfn == unix_stream_sendmsg))
++		ret = unix_stream_sendmsg(sock, msg, size);
++	else
++#endif
++#if IS_BUILTIN(CONFIG_INET)
++	if (sendfn == inet_sendmsg) {
++		struct sock *sk = sock->sk;
++		const struct proto *prot = READ_ONCE(sk->sk_prot);
++
++		/*
++		 * NetZero v2: Fuse socket layer directly into leaf TCP/UDP
++		 * protocol engines without intermediate inet_sendmsg() hops.
++		 */
++		if (likely(prot == &tcp_prot)) {
++			sock_rps_record_flow(sk);
++			ret = tcp_sendmsg(sk, msg, size);
++		} else if (likely(prot == &udp_prot &&
++				  data_race(inet_sk(sk)->inet_num))) {
++			sock_rps_record_flow(sk);
++			ret = udp_sendmsg(sk, msg, size);
++		} else {
++			ret = inet_sendmsg(sock, msg, size);
++		}
++	} else
++#endif
++#if IS_BUILTIN(CONFIG_IPV6)
++	if (sendfn == inet6_sendmsg) {
++		struct sock *sk = sock->sk;
++		const struct proto *prot = READ_ONCE(sk->sk_prot);
++
++		if (likely(prot->sendmsg == tcp_sendmsg && prot->no_autobind)) {
++			sock_rps_record_flow(sk);
++			ret = tcp_sendmsg(sk, msg, size);
++		} else {
++			ret = inet6_sendmsg(sock, msg, size);
++		}
++	} else
++#endif
++#if IS_BUILTIN(CONFIG_UNIX)
++	if (sendfn == unix_dgram_sendmsg)
++		ret = unix_dgram_sendmsg(sock, msg, size);
++	else
++#endif
++	if (sendfn == netlink_sendmsg)
++		ret = netlink_sendmsg(sock, msg, size);
++	else
++		ret = sendfn(sock, msg, size);
++
+ 	if (unlikely(ret == -EIOCBQUEUED)) {
+ 		DEBUG_NET_WARN_ON_ONCE(1);
+ 		ret = -EIO;
+@@ -1151,10 +1217,55 @@ static noinline void call_trace_sock_recv_length(struct sock *sk, int ret, int f
+ static inline int sock_recvmsg_nosec(struct socket *sock, struct msghdr *msg,
+ 				     int flags)
+ {
+-	int ret = INDIRECT_CALL_INET(READ_ONCE(sock->ops)->recvmsg,
+-				     inet6_recvmsg,
+-				     inet_recvmsg, sock, msg,
+-				     msg_data_left(msg), flags);
++	int (*recvfn)(struct socket *, struct msghdr *, size_t, int) =
++		READ_ONCE(sock->ops)->recvmsg;
++	size_t size = msg_data_left(msg);
++	int ret;
++
++#if IS_BUILTIN(CONFIG_UNIX)
++	if (likely(recvfn == unix_stream_recvmsg))
++		ret = unix_stream_recvmsg(sock, msg, size, flags);
++	else
++#endif
++#if IS_BUILTIN(CONFIG_INET)
++	if (recvfn == inet_recvmsg) {
++		struct sock *sk = sock->sk;
++		const struct proto *prot = READ_ONCE(sk->sk_prot);
++
++		if (likely(!(flags & MSG_ERRQUEUE)))
++			sock_rps_record_flow(sk);
++		if (likely(prot == &tcp_prot))
++			ret = tcp_recvmsg(sk, msg, size, flags);
++		else if (likely(prot == &udp_prot))
++			ret = udp_recvmsg(sk, msg, size, flags);
++		else
++			ret = inet_recvmsg(sock, msg, size, flags);
++	} else
++#endif
++#if IS_BUILTIN(CONFIG_IPV6)
++	if (recvfn == inet6_recvmsg) {
++		struct sock *sk = sock->sk;
++		const struct proto *prot = READ_ONCE(sk->sk_prot);
++
++		if (likely(prot->recvmsg == tcp_recvmsg)) {
++			if (likely(!(flags & MSG_ERRQUEUE)))
++				sock_rps_record_flow(sk);
++			ret = tcp_recvmsg(sk, msg, size, flags);
++		} else {
++			ret = inet6_recvmsg(sock, msg, size, flags);
++		}
++	} else
++#endif
++#if IS_BUILTIN(CONFIG_UNIX)
++	if (recvfn == unix_dgram_recvmsg)
++		ret = unix_dgram_recvmsg(sock, msg, size, flags);
++	else
++#endif
++	if (recvfn == netlink_recvmsg)
++		ret = netlink_recvmsg(sock, msg, size, flags);
++	else
++		ret = recvfn(sock, msg, size, flags);
++
+ 	if (trace_sock_recv_length_enabled())
+ 		call_trace_sock_recv_length(sock->sk, ret, flags);
+ 	return ret;
+@@ -1271,6 +1382,83 @@ static ssize_t sock_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 	return res;
+ }
+ 
++static const struct msghdr nz_zero_msghdr;
++
++static noinline ssize_t sock_read_fast_msghdr(struct socket *sock,
++					      char __user *buf, size_t count,
++					      unsigned int flags)
++{
++	struct msghdr msg = { .msg_flags = flags };
++
++	iov_iter_ubuf(&msg.msg_iter, ITER_DEST, buf, count);
++	return sock_recvmsg(sock, &msg, flags);
++}
++
++static noinline ssize_t sock_write_fast_msghdr(struct socket *sock,
++					       const char __user *buf,
++					       size_t count, unsigned int flags)
++{
++	struct msghdr msg = { .msg_flags = flags };
++
++	if (unlikely(sock->type == SOCK_SEQPACKET))
++		msg.msg_flags |= MSG_EOR;
++	iov_iter_ubuf(&msg.msg_iter, ITER_SOURCE, (void __user *)buf, count);
++	return __sock_sendmsg(sock, &msg);
++}
++
++ssize_t sock_read_fast(struct file *file, char __user *buf, size_t count)
++{
++	struct socket *sock = file->private_data;
++	unsigned int flags = (file->f_flags & O_NONBLOCK) ? MSG_DONTWAIT : 0;
++
++	if (unlikely(!count))
++		return 0;
++
++#if IS_BUILTIN(CONFIG_UNIX)
++	if (likely(READ_ONCE(sock->ops) == &unix_stream_ops)) {
++		bool handled;
++		ssize_t ret;
++		int err = security_socket_recvmsg(sock,
++						  (struct msghdr *)&nz_zero_msghdr,
++						  count, flags);
++		if (unlikely(err))
++			return err;
++		ret = unix_ring_direct_recv(sock, buf, count, flags, &handled);
++		if (likely(handled)) {
++			if (trace_sock_recv_length_enabled())
++				call_trace_sock_recv_length(sock->sk, (int)ret, flags);
++			return ret;
++		}
++	}
++#endif
++	return sock_read_fast_msghdr(sock, buf, count, flags);
++}
++
++ssize_t sock_write_fast(struct file *file, const char __user *buf, size_t count)
++{
++	struct socket *sock = file->private_data;
++	unsigned int flags = (file->f_flags & O_NONBLOCK) ? MSG_DONTWAIT : 0;
++
++#if IS_BUILTIN(CONFIG_UNIX)
++	if (likely(READ_ONCE(sock->ops) == &unix_stream_ops)) {
++		bool handled;
++		ssize_t ret;
++		int err = security_socket_sendmsg(sock,
++						  (struct msghdr *)&nz_zero_msghdr,
++						  count);
++		if (unlikely(err))
++			return err;
++		ret = unix_ring_direct_send(sock, buf, count, flags, &handled);
++		if (likely(handled)) {
++			if (trace_sock_send_length_enabled())
++				call_trace_sock_send_length(sock->sk, (int)ret, 0);
++			return ret;
++		}
++	}
++#endif
++	return sock_write_fast_msghdr(sock, buf, count, flags);
++}
++
+ /*
+  * Atomic setting of ioctl hooks to avoid race
+  * with module unload.
+@@ -1496,13 +1684,15 @@ int sock_create_lite(int family, int type, int protocol, struct socket **res)
+ EXPORT_SYMBOL(sock_create_lite);
+ 
+ /* No kernel lock held - perfect */
+-static __poll_t sock_poll(struct file *file, poll_table *wait)
++__poll_t sock_poll(struct file *file, poll_table *wait)
+ {
+ 	struct socket *sock = file->private_data;
+ 	const struct proto_ops *ops = READ_ONCE(sock->ops);
+-	__poll_t events = poll_requested_events(wait), flag = 0;
++	__poll_t (*pollfn)(struct file *, struct socket *, poll_table *);
++	__poll_t events = poll_requested_events(wait), flag = 0, res;
+ 
+-	if (!ops->poll)
++	pollfn = ops->poll;
++	if (!pollfn)
+ 		return 0;
+ 
+ 	if (sk_can_busy_loop(sock->sk)) {
+@@ -1514,8 +1704,28 @@ static __poll_t sock_poll(struct file *file, poll_table *wait)
+ 		flag = POLL_BUSY_LOOP;
+ 	}
+ 
+-	return ops->poll(file, sock, wait) | flag;
++#if IS_BUILTIN(CONFIG_UNIX)
++	if (likely(pollfn == unix_poll))
++		res = unix_poll(file, sock, wait);
++	else if (pollfn == unix_dgram_poll)
++		res = unix_dgram_poll(file, sock, wait);
++	else
++#endif
++#if IS_BUILTIN(CONFIG_INET)
++	if (pollfn == tcp_poll)
++		res = tcp_poll(file, sock, wait);
++	else if (pollfn == udp_poll)
++		res = udp_poll(file, sock, wait);
++	else
++#endif
++	if (pollfn == datagram_poll)
++		res = datagram_poll(file, sock, wait);
++	else
++		res = pollfn(file, sock, wait);
++
++	return res | flag;
+ }
++EXPORT_SYMBOL(sock_poll);
+ 
+ static int sock_mmap(struct file *file, struct vm_area_struct *vma)
+ {
+@@ -2035,6 +2245,33 @@ struct file *do_accept(struct file *file, struct proto_accept_arg *arg,
+ 	if (!sock)
+ 		return ERR_PTR(-ENOTSOCK);
+ 
++	/*
++	 * NetZero: Fast-fail non-blocking accept() when listener queue is empty
++	 * before allocating ~1.1 KiB across sock_alloc + dentry + filp!
++	 */
++	if (((file->f_flags | arg->flags) & O_NONBLOCK) &&
++	    !static_branch_unlikely(&lsm_socket_accept_active)) {
++		struct sock *sk = READ_ONCE(sock->sk);
++
++		if (likely(sk && !READ_ONCE(sk->sk_err) &&
++			   !(READ_ONCE(sk->sk_shutdown) & RCV_SHUTDOWN) &&
++			   READ_ONCE(sk->sk_state) == TCP_LISTEN)) {
++			int fam = READ_ONCE(sk->sk_family);
++
++			if ((fam == AF_INET || fam == AF_INET6) &&
++			    READ_ONCE(sk->sk_protocol) == IPPROTO_TCP &&
++			    reqsk_queue_empty(&inet_csk(sk)->icsk_accept_queue)) {
++				arg->is_empty = 1;
++				return ERR_PTR(-EAGAIN);
++			}
++			if (fam == AF_UNIX &&
++			    skb_queue_empty_lockless(&sk->sk_receive_queue)) {
++				arg->is_empty = 1;
++				return ERR_PTR(-EAGAIN);
++			}
++		}
++	}
++
+ 	newsock = sock_alloc();
+ 	if (!newsock)
+ 		return ERR_PTR(-ENFILE);
+@@ -2245,17 +2482,35 @@ SYSCALL_DEFINE3(getpeername, int, fd, struct sockaddr __user *, usockaddr,
+  *	space and check the user space data area is readable before invoking
+  *	the protocol.
+  */
++static noinline int __sys_sendto_addr(struct socket *sock, void __user *buff,
++				      size_t len, unsigned int flags,
++				      struct sockaddr __user *addr, int addr_len)
++{
++	struct sockaddr_storage address;
++	struct msghdr msg = {};
++	int err;
++
++	iov_iter_ubuf(&msg.msg_iter, ITER_SOURCE, buff, len);
++	if (addr) {
++		err = move_addr_to_kernel(addr, addr_len, &address);
++		if (err < 0)
++			return err;
++		msg.msg_name = (struct sockaddr *)&address;
++		msg.msg_namelen = addr_len;
++	}
++	msg.msg_flags = flags;
++	return __sock_sendmsg(sock, &msg);
++}
++
+ int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
+ 		 struct sockaddr __user *addr,  int addr_len)
+ {
+ 	struct socket *sock;
+-	struct sockaddr_storage address;
+-	int err;
+-	struct msghdr msg;
+ 
+-	err = import_ubuf(ITER_SOURCE, buff, len, &msg.msg_iter);
+-	if (unlikely(err))
+-		return err;
++	if (unlikely(len > MAX_RW_COUNT))
++		len = MAX_RW_COUNT;
++	if (unlikely(!access_ok(buff, len)))
++		return -EFAULT;
+ 
+ 	CLASS(fd, f)(fd);
+ 	if (fd_empty(f))
+@@ -2264,23 +2519,37 @@ int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
+ 	if (unlikely(!sock))
+ 		return -ENOTSOCK;
+ 
+-	msg.msg_name = NULL;
+-	msg.msg_control = NULL;
+-	msg.msg_controllen = 0;
+-	msg.msg_namelen = 0;
+-	msg.msg_ubuf = NULL;
+-	if (addr) {
+-		err = move_addr_to_kernel(addr, addr_len, &address);
+-		if (err < 0)
+-			return err;
+-		msg.msg_name = (struct sockaddr *)&address;
+-		msg.msg_namelen = addr_len;
+-	}
+ 	flags &= ~MSG_INTERNAL_SENDMSG_FLAGS;
+ 	if (sock->file->f_flags & O_NONBLOCK)
+ 		flags |= MSG_DONTWAIT;
+-	msg.msg_flags = flags;
+-	return __sock_sendmsg(sock, &msg);
++
++	if (likely(!addr)) {
++#if IS_BUILTIN(CONFIG_UNIX)
++		if (likely(READ_ONCE(sock->ops) == &unix_stream_ops)) {
++			bool handled;
++			ssize_t ret;
++			int err = security_socket_sendmsg(sock,
++							  (struct msghdr *)&nz_zero_msghdr,
++							  len);
++			if (unlikely(err))
++				return err;
++			ret = unix_ring_direct_send(sock, buff, len, flags, &handled);
++			if (likely(handled)) {
++				if (trace_sock_send_length_enabled())
++					call_trace_sock_send_length(sock->sk, (int)ret, 0);
++				return (int)ret;
++			}
++		}
++#endif
++		{
++			struct msghdr msg = { .msg_flags = flags };
++
++			iov_iter_ubuf(&msg.msg_iter, ITER_SOURCE, buff, len);
++			return __sock_sendmsg(sock, &msg);
++		}
++	}
++
++	return __sys_sendto_addr(sock, buff, len, flags, addr, addr_len);
+ }
+ 
+ SYSCALL_DEFINE6(sendto, int, fd, void __user *, buff, size_t, len,
+@@ -2300,6 +2569,28 @@ SYSCALL_DEFINE4(send, int, fd, void __user *, buff, size_t, len,
+ 	return __sys_sendto(fd, buff, len, flags, NULL, 0);
+ }
+ 
++static noinline int __sys_recvfrom_addr(struct socket *sock, void __user *ubuf,
++					size_t size, unsigned int flags,
++					struct sockaddr __user *addr,
++					int __user *addr_len)
++{
++	struct sockaddr_storage address;
++	struct msghdr msg = {
++		.msg_name = (struct sockaddr *)&address,
++	};
++	int err, err2;
++
++	iov_iter_ubuf(&msg.msg_iter, ITER_DEST, ubuf, size);
++	err = sock_recvmsg(sock, &msg, flags);
++	if (err >= 0) {
++		err2 = move_addr_to_user(&address, msg.msg_namelen,
++					 addr, addr_len);
++		if (err2 < 0)
++			err = err2;
++	}
++	return err;
++}
++
+ /*
+  *	Receive a frame from the socket and optionally record the address of the
+  *	sender. We verify the buffers are writable and if needed move the
+@@ -2308,20 +2599,14 @@ SYSCALL_DEFINE4(send, int, fd, void __user *, buff, size_t, len,
+ int __sys_recvfrom(int fd, void __user *ubuf, size_t size, unsigned int flags,
+ 		   struct sockaddr __user *addr, int __user *addr_len)
+ {
+-	struct sockaddr_storage address;
+-	struct msghdr msg = {
+-		/* Save some cycles and don't copy the address if not needed */
+-		.msg_name = addr ? (struct sockaddr *)&address : NULL,
+-	};
+ 	struct socket *sock;
+-	int err, err2;
+ 
+-	err = import_ubuf(ITER_DEST, ubuf, size, &msg.msg_iter);
+-	if (unlikely(err))
+-		return err;
++	if (unlikely(size > MAX_RW_COUNT))
++		size = MAX_RW_COUNT;
++	if (unlikely(!access_ok(ubuf, size)))
++		return -EFAULT;
+ 
+ 	CLASS(fd, f)(fd);
+-
+ 	if (fd_empty(f))
+ 		return -EBADF;
+ 	sock = sock_from_file(fd_file(f));
+@@ -2330,15 +2615,34 @@ int __sys_recvfrom(int fd, void __user *ubuf, size_t size, unsigned int flags,
+ 
+ 	if (sock->file->f_flags & O_NONBLOCK)
+ 		flags |= MSG_DONTWAIT;
+-	err = sock_recvmsg(sock, &msg, flags);
+ 
+-	if (err >= 0 && addr != NULL) {
+-		err2 = move_addr_to_user(&address,
+-					 msg.msg_namelen, addr, addr_len);
+-		if (err2 < 0)
+-			err = err2;
++	if (likely(!addr)) {
++#if IS_BUILTIN(CONFIG_UNIX)
++		if (likely(READ_ONCE(sock->ops) == &unix_stream_ops)) {
++			bool handled;
++			ssize_t ret;
++			int err = security_socket_recvmsg(sock,
++							  (struct msghdr *)&nz_zero_msghdr,
++							  size, flags);
++			if (unlikely(err))
++				return err;
++			ret = unix_ring_direct_recv(sock, ubuf, size, flags, &handled);
++			if (likely(handled)) {
++				if (trace_sock_recv_length_enabled())
++					call_trace_sock_recv_length(sock->sk, (int)ret, flags);
++				return (int)ret;
++			}
++		}
++#endif
++		{
++			struct msghdr msg = {};
++
++			iov_iter_ubuf(&msg.msg_iter, ITER_DEST, ubuf, size);
++			return sock_recvmsg(sock, &msg, flags);
++		}
+ 	}
+-	return err;
++
++	return __sys_recvfrom_addr(sock, ubuf, size, flags, addr, addr_len);
+ }
+ 
+ SYSCALL_DEFINE6(recvfrom, int, fd, void __user *, ubuf, size_t, size,
+@@ -2659,9 +2963,9 @@ static int ____sys_sendmsg(struct socket *sock, struct msghdr *msg_sys,
+ 			   unsigned int flags, struct used_address *used_address,
+ 			   unsigned int allowed_msghdr_flags)
+ {
+-	unsigned char ctl[sizeof(struct cmsghdr) + 20]
++	unsigned char ctl[256]
+ 				__aligned(sizeof(__kernel_size_t));
+-	/* 20 is size of ipv6_pktinfo */
++	/* 256B covers SCM_CREDENTIALS + up to 52 SCM_RIGHTS FDs on stack */
+ 	unsigned char *ctl_buf = ctl;
+ 	int ctl_len;
+ 	ssize_t err;
+@@ -2811,6 +3115,47 @@ SYSCALL_DEFINE3(sendmsg, int, fd, struct user_msghdr __user *, msg, unsigned int
+  *	Linux sendmmsg interface
+  */
+ 
++static int ___sys_sendmsg_precopied(struct socket *sock,
++				    struct user_msghdr *umsg,
++				    struct msghdr *msg_sys, unsigned int flags,
++				    struct used_address *used_address,
++				    unsigned int allowed_msghdr_flags)
++{
++	struct sockaddr_storage address;
++	struct iovec iovstack[UIO_FASTIOV], *iov = iovstack;
++	ssize_t err;
++
++	msg_sys->msg_name = &address;
++	if (sock->file->f_flags & O_NONBLOCK)
++		flags |= MSG_DONTWAIT;
++
++	err = __copy_msghdr(msg_sys, umsg, NULL);
++	if (unlikely(err))
++		return err;
++
++	if (likely(umsg->msg_iovlen == 1)) {
++		struct iovec iov1;
++
++		if (unlikely(copy_from_user(&iov1, umsg->msg_iov, sizeof(iov1))))
++			return -EFAULT;
++		err = import_ubuf(ITER_SOURCE, iov1.iov_base, iov1.iov_len,
++				  &msg_sys->msg_iter);
++		if (unlikely(err))
++			return err;
++	} else {
++		err = import_iovec(ITER_SOURCE, umsg->msg_iov, umsg->msg_iovlen,
++				   UIO_FASTIOV, &iov, &msg_sys->msg_iter);
++		if (unlikely(err < 0))
++			return err;
++	}
++
++	err = ____sys_sendmsg(sock, msg_sys, flags, used_address,
++			      allowed_msghdr_flags);
++	if (unlikely(iov != iovstack))
++		kfree(iov);
++	return err;
++}
++
+ int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
+ 		   unsigned int flags, bool forbid_cmsg_compat)
+ {
+@@ -2844,6 +3189,40 @@ int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
+ 	err = 0;
+ 	flags |= MSG_BATCH;
+ 
++	if (likely(!(MSG_CMSG_COMPAT & flags) && vlen > 1)) {
++		struct mmsghdr kbatch[8];
++
++		while (datagrams < vlen) {
++			unsigned int rem = vlen - datagrams;
++			unsigned int chunk = rem > 8 ? 8 : rem;
++			unsigned int k;
++
++			if (unlikely(copy_from_user(kbatch, entry,
++						    chunk * sizeof(struct mmsghdr))))
++				break;
++
++			for (k = 0; k < chunk; k++) {
++				if (datagrams == vlen - 1)
++					flags = oflags;
++				err = ___sys_sendmsg_precopied(sock,
++							       &kbatch[k].msg_hdr,
++							       &msg_sys, flags,
++							       &used_address,
++							       MSG_EOR);
++				if (err < 0)
++					goto out_done;
++				err = put_user(err, &entry->msg_len);
++				++entry;
++				if (err)
++					goto out_done;
++				++datagrams;
++				if (msg_data_left(&msg_sys))
++					goto out_done;
++			}
++			cond_resched();
++		}
++	}
++
+ 	while (datagrams < vlen) {
+ 		if (datagrams == vlen - 1)
+ 			flags = oflags;
+@@ -2873,6 +3252,7 @@ int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
+ 		cond_resched();
+ 	}
+ 
++out_done:
+ 	/* We only return an error if no datagrams were able to be sent */
+ 	if (datagrams != 0)
+ 		return datagrams;
+@@ -3021,6 +3401,45 @@ SYSCALL_DEFINE3(recvmsg, int, fd, struct user_msghdr __user *, msg,
+  *     Linux recvmmsg interface
+  */
+ 
++static int ___sys_recvmsg_precopied(struct socket *sock,
++				    struct user_msghdr __user *umsg_user,
++				    struct user_msghdr *umsg,
++				    struct msghdr *msg_sys,
++				    unsigned int flags, int nosec)
++{
++	struct iovec iovstack[UIO_FASTIOV], *iov = iovstack;
++	struct sockaddr __user *uaddr;
++	ssize_t err;
++
++	if (sock->file->f_flags & O_NONBLOCK)
++		flags |= MSG_DONTWAIT;
++
++	err = __copy_msghdr(msg_sys, umsg, &uaddr);
++	if (unlikely(err))
++		return err;
++
++	if (likely(umsg->msg_iovlen == 1)) {
++		struct iovec iov1;
++
++		if (unlikely(copy_from_user(&iov1, umsg->msg_iov, sizeof(iov1))))
++			return -EFAULT;
++		err = import_ubuf(ITER_DEST, iov1.iov_base, iov1.iov_len,
++				  &msg_sys->msg_iter);
++		if (unlikely(err))
++			return err;
++	} else {
++		err = import_iovec(ITER_DEST, umsg->msg_iov, umsg->msg_iovlen,
++				   UIO_FASTIOV, &iov, &msg_sys->msg_iter);
++		if (unlikely(err < 0))
++			return err;
++	}
++
++	err = ____sys_recvmsg(sock, msg_sys, umsg_user, uaddr, flags, nosec);
++	if (unlikely(iov != iovstack))
++		kfree(iov);
++	return err;
++}
++
+ static int do_recvmmsg(int fd, struct mmsghdr __user *mmsg,
+ 			  unsigned int vlen, unsigned int flags,
+ 			  struct timespec64 *timeout)
+@@ -3057,6 +3476,41 @@ static int do_recvmmsg(int fd, struct mmsghdr __user *mmsg,
+ 	entry = mmsg;
+ 	compat_entry = (struct compat_mmsghdr __user *)mmsg;
+ 
++	if (likely(!(MSG_CMSG_COMPAT & flags) && vlen > 1 && !timeout)) {
++		struct mmsghdr kbatch[8];
++
++		while (datagrams < vlen) {
++			unsigned int rem = vlen - datagrams;
++			unsigned int chunk = rem > 8 ? 8 : rem;
++			unsigned int k;
++
++			if (unlikely(copy_from_user(kbatch, entry,
++						    chunk * sizeof(struct mmsghdr))))
++				break;
++
++			for (k = 0; k < chunk; k++) {
++				err = ___sys_recvmsg_precopied(sock,
++							       &entry->msg_hdr,
++							       &kbatch[k].msg_hdr,
++							       &msg_sys,
++							       flags & ~MSG_WAITFORONE,
++							       datagrams);
++				if (err < 0)
++					goto out_recvd;
++				err = put_user(err, &entry->msg_len);
++				++entry;
++				if (err)
++					goto out_recvd;
++				++datagrams;
++				if (flags & MSG_WAITFORONE)
++					flags |= MSG_DONTWAIT;
++				if (unlikely(msg_sys.msg_flags & MSG_OOB))
++					goto out_recvd;
++			}
++			cond_resched();
++		}
++	}
++
+ 	while (datagrams < vlen) {
+ 		/*
+ 		 * No need to ask LSM for more than the first datagram.
+@@ -3107,6 +3561,8 @@ static int do_recvmmsg(int fd, struct mmsghdr __user *mmsg,
+ 		cond_resched();
+ 	}
+ 
++out_recvd:
++
+ 	if (err == 0)
+ 		return datagrams;
+ 

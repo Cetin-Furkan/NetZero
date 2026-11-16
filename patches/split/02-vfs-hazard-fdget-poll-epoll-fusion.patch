@@ -1,0 +1,743 @@
+diff --git a/arch/x86/include/asm/thread_info.h b/arch/x86/include/asm/thread_info.h
+index 0067684af..43472d344 100644
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -66,6 +66,7 @@ struct thread_info {
+ #ifdef CONFIG_SMP
+ 	u32			cpu;		/* current CPU */
+ #endif
++	unsigned long		active_fd_file;	/* NetZero MT fdget hazard slot */
+ };
+ 
+ #define INIT_THREAD_INFO(tsk)			\
+diff --git a/fs/eventpoll.c b/fs/eventpoll.c
+index b959af047..ee46857da 100644
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@ -1329,9 +1329,25 @@ static __poll_t __ep_eventpoll_poll(struct file *file, poll_table *wait, int dep
+ static __poll_t ep_item_poll(const struct epitem *epi, poll_table *pt,
+ 				 int depth)
+ {
+-	struct file *file = epi_fget(epi);
++	struct file *file = epi->ffd.file;
+ 	__poll_t res;
+ 
++	/*
++	 * Fast path for sockets: caller holds ep->mtx, and __fput() blocks
++	 * in eventpoll_release_file() on ep->mtx BEFORE calling f_op->release
++	 * (sock_close). Thus as long as file_ref_read() is non-zero, @file and
++	 * its underlying struct socket remain open and pinned for the entire
++	 * vfs_poll() call without atomic file_ref_get()/fput() RMWs.
++	 */
++	if (likely(sock_from_file(file))) {
++		if (unlikely(!file_ref_read(&file->f_ref)))
++			return 0;
++		pt->_key = epi->event.events;
++		return vfs_poll(file, pt) & epi->event.events;
++	}
++
++	file = epi_fget(epi);
++
+ 	/*
+ 	 * We could return EPOLLERR | EPOLLHUP or something, but let's
+ 	 * treat this more as "file doesn't exist, poll didn't happen".
+@@ -2070,53 +2086,10 @@ static int ep_modify(struct eventpoll *ep, struct epitem *epi,
+  * PM bookkeeping and level-triggered re-queue are handled here.
+  * Caller holds ep->mtx and the scan is active.
+  */
+-static int ep_deliver_event(struct eventpoll *ep, struct epitem *epi,
+-			    poll_table *pt,
+-			    struct epoll_event __user **uevents,
+-			    struct list_head *scan_batch)
+-{
+-	struct epoll_event __user *next;
+-	struct wakeup_source *ws;
+-	__poll_t revents;
+-
+-	/*
+-	 * Activate ep->ws before deactivating epi->ws to prevent
+-	 * triggering auto-suspend here (in case we reactivate epi->ws
+-	 * below).  Rearranging to delay the deactivation would let
+-	 * epi->ws drift out of sync with ep_is_linked().
+-	 */
+-	ws = ep_wakeup_source(epi);
+-	if (ws) {
+-		if (ws->active)
+-			__pm_stay_awake(ep->ws);
+-		__pm_relax(ws);
+-	}
+-
+-	list_del_init(&epi->rdllink);
+-
+-	/*
+-	 * Re-poll under ep->mtx so userspace cannot change the item
+-	 * out from under us. If no caller-requested events remain,
+-	 * @epi stays off the ready list; the poll callback will
+-	 * re-queue it when events next appear.
+-	 */
+-	revents = ep_item_poll(epi, pt, 1);
+-	if (!revents)
+-		return 0;
+-
+-	next = epoll_put_uevent(revents, epi->event.data, *uevents);
+-	if (!next) {
+-		/*
+-		 * copy_to_user() faulted: put the item back so
+-		 * ep_done_scan() splices it onto rdllist for the next
+-		 * attempt.
+-		 */
+-		list_add(&epi->rdllink, scan_batch);
+-		ep_pm_stay_awake(epi);
+-		return -EFAULT;
+-	}
+-	*uevents = next;
++#define EP_SEND_BATCH 32
+ 
++static inline void ep_commit_delivered(struct eventpoll *ep, struct epitem *epi)
++{
+ 	if (epi->event.events & EPOLLONESHOT) {
+ 		epi->event.events &= EP_PRIVATE_BITS;
+ 	} else if (!(epi->event.events & EPOLLET)) {
+@@ -2130,15 +2103,55 @@ static int ep_deliver_event(struct eventpoll *ep, struct epitem *epi,
+ 		list_add_tail(&epi->rdllink, &ep->rdllist);
+ 		ep_pm_stay_awake(epi);
+ 	}
+-	return 1;
++}
++
++static int ep_flush_batch(struct eventpoll *ep,
++			  struct epoll_event *kbatch,
++			  struct epitem **ebatch,
++			  int nbatch,
++			  struct epoll_event __user **uevents,
++			  struct list_head *scan_batch,
++			  int *res)
++{
++	int i, j;
++
++#if !(defined(CONFIG_ARM) && defined(CONFIG_OABI_COMPAT))
++	if (likely(!copy_to_user(*uevents, kbatch, nbatch * sizeof(kbatch[0])))) {
++		*uevents += nbatch;
++		for (i = 0; i < nbatch; i++)
++			ep_commit_delivered(ep, ebatch[i]);
++		*res += nbatch;
++		return 0;
++	}
++#endif
++
++	for (i = 0; i < nbatch; i++) {
++		struct epoll_event __user *next;
++
++		next = epoll_put_uevent(kbatch[i].events, kbatch[i].data, *uevents);
++		if (!next) {
++			for (j = nbatch - 1; j >= i; j--) {
++				list_add(&ebatch[j]->rdllink, scan_batch);
++				ep_pm_stay_awake(ebatch[j]);
++			}
++			return -EFAULT;
++		}
++		*uevents = next;
++		ep_commit_delivered(ep, ebatch[i]);
++		(*res)++;
++	}
++	return 0;
+ }
+ 
+ static int ep_send_events(struct eventpoll *ep,
+ 			  struct epoll_event __user *events, int maxevents)
+ {
++	struct epoll_event kbatch[EP_SEND_BATCH];
++	struct epitem *ebatch[EP_SEND_BATCH];
+ 	struct epitem *epi, *tmp;
+ 	LIST_HEAD(scan_batch);
+ 	poll_table pt;
++	int nbatch = 0;
+ 	int res = 0;
+ 
+ 	/*
+@@ -2166,18 +2179,47 @@ static int ep_send_events(struct eventpoll *ep,
+ 	 * scan_batch; items cannot vanish while we hold ep->mtx.
+ 	 */
+ 	list_for_each_entry_safe(epi, tmp, &scan_batch, rdllink) {
+-		int delivered;
++		struct wakeup_source *ws;
++		__poll_t revents;
+ 
+-		if (res >= maxevents)
++		if (res + nbatch >= maxevents)
+ 			break;
+ 
+-		delivered = ep_deliver_event(ep, epi, &pt, &events, &scan_batch);
+-		if (delivered < 0) {
+-			if (!res)
+-				res = delivered;
+-			break;
++		ws = ep_wakeup_source(epi);
++		if (ws) {
++			if (ws->active)
++				__pm_stay_awake(ep->ws);
++			__pm_relax(ws);
+ 		}
+-		res += delivered;
++
++		list_del_init(&epi->rdllink);
++
++		revents = ep_item_poll(epi, &pt, 1);
++		if (!revents)
++			continue;
++
++		kbatch[nbatch].events = revents;
++		kbatch[nbatch].data = epi->event.data;
++		ebatch[nbatch] = epi;
++		nbatch++;
++
++		if (nbatch == EP_SEND_BATCH) {
++			int err = ep_flush_batch(ep, kbatch, ebatch, nbatch,
++						 &events, &scan_batch, &res);
++			nbatch = 0;
++			if (unlikely(err < 0)) {
++				if (!res)
++					res = err;
++				break;
++			}
++		}
++	}
++
++	if (nbatch > 0) {
++		int err = ep_flush_batch(ep, kbatch, ebatch, nbatch,
++					 &events, &scan_batch, &res);
++		if (unlikely(err < 0) && !res)
++			res = err;
+ 	}
+ 
+ 	ep_done_scan(ep, &scan_batch);
+diff --git a/fs/file.c b/fs/file.c
+index fd08d3487..b49706a42 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -450,6 +450,7 @@ struct files_struct *dup_fd(struct files_struct *oldf, struct fd_range *range)
+ 
+ 	spin_lock_init(&newf->file_lock);
+ 	newf->resize_in_progress = false;
++	newf->shared_outside_tg = false;
+ 	init_waitqueue_head(&newf->resize_wait);
+ 	newf->next_fd = 0;
+ 	new_fdt = &newf->fdtab;
+@@ -788,6 +789,41 @@ EXPORT_SYMBOL(fd_install);
+  *
+  * Returns: The file associated with @fd (NULL if @fd is not open)
+  */
++/*
++ * NetZero: Promote any active per-thread fdget() hazard borrow on @file to a
++ * real file_ref before the caller drops the fdtable's reference in filp_close.
++ * Paired with the Dekker smp_mb() in __fget_light().
++ */
++static inline void files_promote_hazard(struct files_struct *files,
++					struct file *file)
++{
++	struct task_struct *t;
++	unsigned long exp;
++
++	if (likely(atomic_read(&files->count) <= 1) ||
++	    unlikely(READ_ONCE(files->shared_outside_tg)))
++		return;
++
++	smp_mb();
++	exp = (unsigned long)file;
++	rcu_read_lock();
++	for_each_thread(current, t) {
++		unsigned long cur;
++
++		if (READ_ONCE(t->files) != files)
++			continue;
++		cur = READ_ONCE(task_thread_info(t)->active_fd_file);
++
++		if (unlikely(cur == exp)) {
++			get_file(file);
++			if (!try_cmpxchg(&task_thread_info(t)->active_fd_file,
++					 &cur, exp | 1UL))
++				fput(file);
++		}
++	}
++	rcu_read_unlock();
++}
++
+ struct file *file_close_fd_locked(struct files_struct *files, unsigned fd)
+ {
+ 	struct fdtable *fdt = files_fdtable(files);
+@@ -803,6 +839,7 @@ struct file *file_close_fd_locked(struct files_struct *files, unsigned fd)
+ 	if (file) {
+ 		rcu_assign_pointer(fdt->fd[fd], NULL);
+ 		__put_unused_fd(files, fd);
++		files_promote_hazard(files, file);
+ 	}
+ 	return file;
+ }
+@@ -1345,6 +1382,36 @@ static inline struct fd __fget_light(unsigned int fd, fmode_t mask)
+ 		if (!file || unlikely(file->f_mode & mask))
+ 			return EMPTY_FD;
+ 		return BORROWED_FD(file);
++	} else if (likely(!READ_ONCE(files->shared_outside_tg) &&
++			  !READ_ONCE(current_thread_info()->active_fd_file))) {
++		struct fdtable *fdt;
++		struct file __rcu **fdentry;
++		unsigned long nospec_mask;
++
++		rcu_read_lock();
++		fdt = rcu_dereference_raw(files->fdt);
++		nospec_mask = array_index_mask_nospec(fd, fdt->max_fds);
++		fdentry = fdt->fd + (fd & nospec_mask);
++		file = (void *)(nospec_mask & (unsigned long)rcu_dereference_raw(*fdentry));
++		if (unlikely(!file || (file->f_mode & mask))) {
++			rcu_read_unlock();
++			return EMPTY_FD;
++		}
++		WRITE_ONCE(current_thread_info()->active_fd_file, (unsigned long)file);
++		smp_mb();
++		if (likely(rcu_dereference_raw(*fdentry) == file &&
++			   rcu_dereference_raw(files->fdt) == fdt &&
++			   !READ_ONCE(files->shared_outside_tg))) {
++			rcu_read_unlock();
++			return HAZARD_FD(file);
++		}
++		if (unlikely(xchg(&current_thread_info()->active_fd_file, 0UL) & 1UL))
++			fput(file);
++		rcu_read_unlock();
++		file = __fget_files(files, fd, mask);
++		if (!file)
++			return EMPTY_FD;
++		return CLONED_FD(file);
+ 	} else {
+ 		file = __fget_files(files, fd, mask);
+ 		if (!file)
+@@ -1484,6 +1551,8 @@ __releases(&files->file_lock)
+ 	get_file(file);
+ 	rcu_assign_pointer(fdt->fd[fd], file);
+ 	__set_open_fd(fd, fdt, flags & O_CLOEXEC);
++	if (tofree)
++		files_promote_hazard(files, tofree);
+ 	spin_unlock(&files->file_lock);
+ 
+ 	if (tofree)
+diff --git a/fs/read_write.c b/fs/read_write.c
+index b15522cf9..c6bfc0405 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -21,6 +21,7 @@
+ #include <linux/mount.h>
+ #include <linux/fs.h>
+ #include <linux/filelock.h>
++#include <linux/net.h>
+ #include "internal.h"
+ 
+ #include <linux/uaccess.h>
+@@ -548,7 +549,9 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+ 	if (count > MAX_RW_COUNT)
+ 		count =  MAX_RW_COUNT;
+ 
+-	if (file->f_op->read)
++	if (!pos && sock_from_file(file))
++		ret = sock_read_fast(file, buf, count);
++	else if (file->f_op->read)
+ 		ret = file->f_op->read(file, buf, count, pos);
+ 	else if (file->f_op->read_iter)
+ 		ret = new_sync_read(file, buf, count, pos);
+@@ -661,7 +664,9 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
+ 	if (count > MAX_RW_COUNT)
+ 		count =  MAX_RW_COUNT;
+ 	file_start_write(file);
+-	if (file->f_op->write)
++	if (!pos && sock_from_file(file))
++		ret = sock_write_fast(file, buf, count);
++	else if (file->f_op->write)
+ 		ret = file->f_op->write(file, buf, count, pos);
+ 	else if (file->f_op->write_iter)
+ 		ret = new_sync_write(file, buf, count, pos);
+diff --git a/fs/select.c b/fs/select.c
+index 95d765310..d3550d5e2 100644
+--- a/fs/select.c
++++ b/fs/select.c
+@@ -971,8 +971,52 @@ static int do_poll(struct poll_list *list, struct poll_wqueues *wait,
+ #define N_STACK_PPS ((sizeof(stack_pps) - sizeof(struct poll_list))  / \
+ 			sizeof(struct pollfd))
+ 
+-static int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
+-		struct timespec64 *end_time)
++static int do_sys_poll_nowait_small(struct pollfd __user *ufds, unsigned int nfds)
++{
++	struct pollfd pfds[8];
++	poll_table pt = { ._qproc = NULL };
++	__poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0;
++	bool can_busy_loop = false;
++	unsigned int i;
++	int count = 0;
++
++	if (unlikely(!nfds))
++		return unlikely(signal_pending(current)) ? -ERESTARTNOHAND : 0;
++
++	if (unlikely(copy_from_user(pfds, ufds, nfds * sizeof(struct pollfd))))
++		return -EFAULT;
++
++	for (i = 0; i < nfds; i++) {
++		__poll_t mask = do_pollfd(&pfds[i], &pt, &can_busy_loop, busy_flag);
++
++		pfds[i].revents = mangle_poll(mask);
++		if (mask) {
++			count++;
++			busy_flag = 0;
++		}
++	}
++
++	if (nfds == 1) {
++		if (unlikely(put_user(pfds[0].revents, &ufds[0].revents)))
++			return -EFAULT;
++	} else {
++		scoped_user_write_access_size(ufds, nfds * sizeof(*ufds), efault_out) {
++			for (i = 0; i < nfds; i++)
++				unsafe_put_user(pfds[i].revents, &ufds[i].revents, efault_out);
++		}
++	}
++
++	if (!count && unlikely(signal_pending(current)))
++		return -ERESTARTNOHAND;
++	return count;
++
++efault_out:
++	return -EFAULT;
++}
++
++static noinline int do_sys_poll_slow(struct pollfd __user *ufds,
++				     unsigned int nfds,
++				     struct timespec64 *end_time)
+ {
+ 	struct poll_wqueues table;
+ 	int err = -EFAULT, fdcount;
+@@ -985,9 +1029,6 @@ static int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
+ 	unsigned int todo = nfds;
+ 	unsigned int len;
+ 
+-	if (nfds > rlimit(RLIMIT_NOFILE))
+-		return -EINVAL;
+-
+ 	len = min_t(unsigned int, nfds, N_STACK_PPS);
+ 	for (;;) {
+ 		walk->next = NULL;
+@@ -1039,6 +1080,22 @@ static int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
+ 	return err;
+ }
+ 
++static int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
++		struct timespec64 *end_time)
++{
++	if (unlikely(nfds > rlimit(RLIMIT_NOFILE)))
++		return -EINVAL;
++
++	/*
++	 * NetZero v2: Bypass 1.1 KiB poll_wqueues + stack_pps allocation/zeroing
++	 * and linked-list walking on non-blocking readiness probes (nfds <= 8).
++	 */
++	if (nfds <= 8 && end_time && !end_time->tv_sec && !end_time->tv_nsec)
++		return do_sys_poll_nowait_small(ufds, nfds);
++
++	return do_sys_poll_slow(ufds, nfds, end_time);
++}
++
+ static long do_restart_poll(struct restart_block *restart_block)
+ {
+ 	struct pollfd __user *ufds = restart_block->poll.ufds;
+diff --git a/include/linux/fdtable.h b/include/linux/fdtable.h
+index ba2536c3b..be08c2e5e 100644
+--- a/include/linux/fdtable.h
++++ b/include/linux/fdtable.h
+@@ -41,6 +41,7 @@ struct files_struct {
+    */
+ 	atomic_t count;
+ 	bool resize_in_progress;
++	bool shared_outside_tg;
+ 	wait_queue_head_t resize_wait;
+ 
+ 	struct fdtable __rcu *fdt;
+diff --git a/include/linux/file.h b/include/linux/file.h
+index 41c3c0be1..87ccded2e 100644
+--- a/include/linux/file.h
++++ b/include/linux/file.h
+@@ -13,6 +13,7 @@
+ #include <linux/cleanup.h>
+ #include <linux/err.h>
+ #include <linux/vfsdebug.h>
++#include <linux/thread_info.h>
+ 
+ struct file;
+ 
+@@ -41,8 +42,9 @@ struct fd {
+ };
+ #define FDPUT_FPUT       1
+ #define FDPUT_POS_UNLOCK 2
++#define FDPUT_HAZARD     4
+ 
+-#define fd_file(f) ((struct file *)((f).word & ~(FDPUT_FPUT|FDPUT_POS_UNLOCK)))
++#define fd_file(f) ((struct file *)((f).word & ~(FDPUT_FPUT|FDPUT_POS_UNLOCK|FDPUT_HAZARD)))
+ static inline bool fd_empty(struct fd f)
+ {
+ 	return unlikely(!f.word);
+@@ -57,11 +59,20 @@ static inline struct fd CLONED_FD(struct file *f)
+ {
+ 	return (struct fd){(unsigned long)f | FDPUT_FPUT};
+ }
++static inline struct fd HAZARD_FD(struct file *f)
++{
++	return (struct fd){(unsigned long)f | FDPUT_HAZARD};
++}
+ 
+ static inline void fdput(struct fd fd)
+ {
+-	if (unlikely(fd.word & FDPUT_FPUT))
++	if (fd.word & FDPUT_HAZARD) {
++		unsigned long old = xchg(&current_thread_info()->active_fd_file, 0UL);
++		if (unlikely(old & 1UL))
++			fput(fd_file(fd));
++	} else if (unlikely(fd.word & FDPUT_FPUT)) {
+ 		fput(fd_file(fd));
++	}
+ }
+ 
+ extern struct file *fget(unsigned int fd);
+diff --git a/include/linux/poll.h b/include/linux/poll.h
+index 12bb18e8b..bb087b6d3 100644
+--- a/include/linux/poll.h
++++ b/include/linux/poll.h
+@@ -75,8 +75,17 @@ static inline bool file_can_poll(struct file *file)
+ 	return file->f_op->poll;
+ }
+ 
++#ifdef CONFIG_NET
++extern const struct file_operations socket_file_ops;
++extern __poll_t sock_poll(struct file *file, struct poll_table_struct *pt);
++#endif
++
+ static inline __poll_t vfs_poll(struct file *file, struct poll_table_struct *pt)
+ {
++#ifdef CONFIG_NET
++	if (likely(file->f_op == &socket_file_ops))
++		return sock_poll(file, pt);
++#endif
+ 	if (unlikely(!file->f_op->poll))
+ 		return DEFAULT_POLLMASK;
+ 	return file->f_op->poll(file, pt);
+diff --git a/include/linux/security.h b/include/linux/security.h
+index 40831fab5..2e156cecf 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -38,6 +38,7 @@
+ #include <linux/lsm/smack.h>
+ #include <linux/lsm/apparmor.h>
+ #include <linux/lsm/bpf.h>
++#include <linux/jump_label.h>
+ 
+ struct linux_binprm;
+ struct cred;
+@@ -474,7 +475,14 @@ int security_inode_setintegrity(const struct inode *inode,
+ 				size_t size);
+ int security_kernfs_init_security(struct kernfs_node *kn_dir,
+ 				  struct kernfs_node *kn);
+-int security_file_permission(struct file *file, int mask);
++DECLARE_STATIC_KEY_FALSE(lsm_file_permission_active);
++int __security_file_permission(struct file *file, int mask);
++static inline int security_file_permission(struct file *file, int mask)
++{
++	if (!static_branch_unlikely(&lsm_file_permission_active))
++		return 0;
++	return __security_file_permission(file, mask);
++}
+ int security_file_alloc(struct file *file);
+ void security_file_release(struct file *file);
+ void security_file_free(struct file *file);
+@@ -1702,16 +1710,46 @@ int security_socket_socketpair(struct socket *socka, struct socket *sockb);
+ int security_socket_bind(struct socket *sock, struct sockaddr *address, int addrlen);
+ int security_socket_connect(struct socket *sock, struct sockaddr *address, int addrlen);
+ int security_socket_listen(struct socket *sock, int backlog);
+-int security_socket_accept(struct socket *sock, struct socket *newsock);
+-int security_socket_sendmsg(struct socket *sock, struct msghdr *msg, int size);
+-int security_socket_recvmsg(struct socket *sock, struct msghdr *msg,
+-			    int size, int flags);
++DECLARE_STATIC_KEY_FALSE(lsm_socket_accept_active);
++DECLARE_STATIC_KEY_FALSE(lsm_socket_sendmsg_active);
++DECLARE_STATIC_KEY_FALSE(lsm_socket_recvmsg_active);
++DECLARE_STATIC_KEY_FALSE(lsm_sock_rcv_skb_active);
++int __security_socket_accept(struct socket *sock, struct socket *newsock);
++static inline int security_socket_accept(struct socket *sock, struct socket *newsock)
++{
++	if (!static_branch_unlikely(&lsm_socket_accept_active))
++		return 0;
++	return __security_socket_accept(sock, newsock);
++}
++int __security_socket_sendmsg(struct socket *sock, struct msghdr *msg, int size);
++int __security_socket_recvmsg(struct socket *sock, struct msghdr *msg,
++			      int size, int flags);
++int __security_sock_rcv_skb(struct sock *sk, struct sk_buff *skb);
++
++static inline int security_socket_sendmsg(struct socket *sock, struct msghdr *msg, int size)
++{
++	if (!static_branch_unlikely(&lsm_socket_sendmsg_active))
++		return 0;
++	return __security_socket_sendmsg(sock, msg, size);
++}
++static inline int security_socket_recvmsg(struct socket *sock, struct msghdr *msg,
++					  int size, int flags)
++{
++	if (!static_branch_unlikely(&lsm_socket_recvmsg_active))
++		return 0;
++	return __security_socket_recvmsg(sock, msg, size, flags);
++}
+ int security_socket_getsockname(struct socket *sock);
+ int security_socket_getpeername(struct socket *sock);
+ int security_socket_getsockopt(struct socket *sock, int level, int optname);
+ int security_socket_setsockopt(struct socket *sock, int level, int optname);
+ int security_socket_shutdown(struct socket *sock, int how);
+-int security_sock_rcv_skb(struct sock *sk, struct sk_buff *skb);
++static inline int security_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
++{
++	if (!static_branch_unlikely(&lsm_sock_rcv_skb_active))
++		return 0;
++	return __security_sock_rcv_skb(sk, skb);
++}
+ int security_socket_getpeersec_stream(struct socket *sock, sockptr_t optval,
+ 				      sockptr_t optlen, unsigned int len);
+ int security_socket_getpeersec_dgram(struct socket *sock, struct sk_buff *skb, u32 *secid);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 5efceb8d5..e16152aa2 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1678,6 +1678,8 @@ static int copy_files(u64 clone_flags, struct task_struct *tsk,
+ {
+ 	struct files_struct *oldf, *newf;
+ 
++	task_thread_info(tsk)->active_fd_file = 0;
++
+ 	/*
+ 	 * A background process may not have any files ...
+ 	 */
+@@ -1691,6 +1693,8 @@ static int copy_files(u64 clone_flags, struct task_struct *tsk,
+ 	}
+ 
+ 	if (clone_flags & CLONE_FILES) {
++		if (unlikely(!(clone_flags & CLONE_THREAD)))
++			WRITE_ONCE(oldf->shared_outside_tg, true);
+ 		atomic_inc(&oldf->count);
+ 		tsk->files = oldf;
+ 		return 0;
+diff --git a/security/lsm_init.c b/security/lsm_init.c
+index 8d5ecea99..1a88f8c81 100644
+--- a/security/lsm_init.c
++++ b/security/lsm_init.c
+@@ -350,6 +350,18 @@ static int __init lsm_static_call_init(struct security_hook_list *hl)
+ 					     hl->hook.lsm_func_addr);
+ 			scall->hl = hl;
+ 			static_branch_enable(scall->active);
++			if (hl->scalls == static_calls_table.file_permission)
++				static_branch_enable(&lsm_file_permission_active);
++#ifdef CONFIG_SECURITY_NETWORK
++			else if (hl->scalls == static_calls_table.socket_accept)
++				static_branch_enable(&lsm_socket_accept_active);
++			else if (hl->scalls == static_calls_table.socket_sendmsg)
++				static_branch_enable(&lsm_socket_sendmsg_active);
++			else if (hl->scalls == static_calls_table.socket_recvmsg)
++				static_branch_enable(&lsm_socket_recvmsg_active);
++			else if (hl->scalls == static_calls_table.socket_sock_rcv_skb)
++				static_branch_enable(&lsm_sock_rcv_skb_active);
++#endif
+ 			return 0;
+ 		}
+ 		scall++;
+diff --git a/security/security.c b/security/security.c
+index 4727b8347..b30b9c4b2 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -86,6 +86,19 @@ struct kmem_cache *lsm_file_cache;
+ struct kmem_cache *lsm_backing_file_cache;
+ struct kmem_cache *lsm_inode_cache;
+ 
++DEFINE_STATIC_KEY_FALSE(lsm_file_permission_active);
++EXPORT_SYMBOL(lsm_file_permission_active);
++#ifdef CONFIG_SECURITY_NETWORK
++DEFINE_STATIC_KEY_FALSE(lsm_socket_accept_active);
++EXPORT_SYMBOL(lsm_socket_accept_active);
++DEFINE_STATIC_KEY_FALSE(lsm_socket_sendmsg_active);
++EXPORT_SYMBOL(lsm_socket_sendmsg_active);
++DEFINE_STATIC_KEY_FALSE(lsm_socket_recvmsg_active);
++EXPORT_SYMBOL(lsm_socket_recvmsg_active);
++DEFINE_STATIC_KEY_FALSE(lsm_sock_rcv_skb_active);
++EXPORT_SYMBOL(lsm_sock_rcv_skb_active);
++#endif
++
+ #define SECURITY_HOOK_ACTIVE_KEY(HOOK, IDX) security_hook_active_##HOOK##_##IDX
+ 
+ /*
+@@ -2410,10 +2423,11 @@ int security_kernfs_init_security(struct kernfs_node *kn_dir,
+  *
+  * Return: Returns 0 if permission is granted.
+  */
+-int security_file_permission(struct file *file, int mask)
++int __security_file_permission(struct file *file, int mask)
+ {
+ 	return call_int_hook(file_permission, file, mask);
+ }
++EXPORT_SYMBOL(__security_file_permission);
+ 
+ /**
+  * security_file_alloc() - Allocate and init a file's LSM blob
+@@ -4372,10 +4386,11 @@ int security_socket_listen(struct socket *sock, int backlog)
+  *
+  * Return: Returns 0 if permission is granted.
+  */
+-int security_socket_accept(struct socket *sock, struct socket *newsock)
++int __security_socket_accept(struct socket *sock, struct socket *newsock)
+ {
+ 	return call_int_hook(socket_accept, sock, newsock);
+ }
++EXPORT_SYMBOL(__security_socket_accept);
+ 
+ /**
+  * security_socket_sendmsg() - Check if sending a message is allowed
+@@ -4387,10 +4402,11 @@ int security_socket_accept(struct socket *sock, struct socket *newsock)
+  *
+  * Return: Returns 0 if permission is granted.
+  */
+-int security_socket_sendmsg(struct socket *sock, struct msghdr *msg, int size)
++int __security_socket_sendmsg(struct socket *sock, struct msghdr *msg, int size)
+ {
+ 	return call_int_hook(socket_sendmsg, sock, msg, size);
+ }
++EXPORT_SYMBOL(__security_socket_sendmsg);
+ 
+ /**
+  * security_socket_recvmsg() - Check if receiving a message is allowed
+@@ -4403,11 +4419,12 @@ int security_socket_sendmsg(struct socket *sock, struct msghdr *msg, int size)
+  *
+  * Return: Returns 0 if permission is granted.
+  */
+-int security_socket_recvmsg(struct socket *sock, struct msghdr *msg,
+-			    int size, int flags)
++int __security_socket_recvmsg(struct socket *sock, struct msghdr *msg,
++			      int size, int flags)
+ {
+ 	return call_int_hook(socket_recvmsg, sock, msg, size, flags);
+ }
++EXPORT_SYMBOL(__security_socket_recvmsg);
+ 
+ /**
+  * security_socket_getsockname() - Check if reading the socket addr is allowed
+@@ -4494,11 +4511,11 @@ int security_socket_shutdown(struct socket *sock, int how)
+  *
+  * Return: Returns 0 if permission is granted.
+  */
+-int security_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
++int __security_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
+ {
+ 	return call_int_hook(socket_sock_rcv_skb, sk, skb);
+ }
+-EXPORT_SYMBOL(security_sock_rcv_skb);
++EXPORT_SYMBOL(__security_sock_rcv_skb);
+ 
+ /**
+  * security_socket_getpeersec_stream() - Get the remote peer label

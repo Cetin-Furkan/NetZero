@@ -1,0 +1,9 @@
+/linux-src/
+/build/
+/build-host/
+/benchmarks/grand_socket_bench
+/benchmarks/live_wayland_ping
+/benchmarks/netzero_bench
+/benchmarks/wan_bloat_bench
+**/__pycache__/
+*.pyc

@@ -1,0 +1,19 @@
+diff --git a/sound/soc/soc-core.c b/sound/soc/soc-core.c
+index 68b54e509..626822ffe 100644
+--- a/sound/soc/soc-core.c
++++ b/sound/soc/soc-core.c
+@@ -387,6 +387,14 @@ static struct snd_soc_pcm_runtime *soc_new_pcm_runtime(
+ 		device_unregister(dev);
+ 		return NULL;
+ 	}
++	/*
++	 * devm_kzalloc_flex() initializes __counted_by(num_components) to max
++	 * capacity, whereas snd_soc_rtd_add_component() increments
++	 * num_components from 0 as components are populated. Reset to 0 so
++	 * components[0..N-1] are filled in-bounds and for_each_rtd_components()
++	 * does not terminate early on NULL slots.
++	 */
++	rtd->num_components = 0;
+ 
+ 	rtd->dev = dev;
+ 	INIT_LIST_HEAD(&rtd->list);

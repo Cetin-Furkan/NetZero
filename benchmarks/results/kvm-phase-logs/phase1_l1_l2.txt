@@ -1,0 +1,60 @@
+c[?7l[2J[0mSeaBIOS (version Arch Linux 1.17.0-2-2)
+Booting from ROM..c[?7l[2J============================================================
+[NetZero KVM] Booted: Linux 7.4.0-rc2-g7e1392a42ea2-dirty x86_64
+[NetZero KVM] CPUs: 4 | Mem: 2038508 kB
+============================================================
+--- Kernel & Active Sysctls ---
+Linux (none) 7.4.0-rc2-g7e1392a42ea2-dirty #2 SMP PREEMPT_DYNAMIC Sat Nov 14 12:52:48 +03 2026 x86_64 GNU/Linux
+CC available: reno bbr cubic
+Default qdisc: pfifo_fast
+--- Struct Sizes & Protocol Census (/proc/net/protocols) ---
+protocol  size sockets  memory press maxhdr  slab module     cl co di ac io in de sh ss gs se re bi br ha uh gp em
+PACKET    1664      0      -1   NI       0   no   kernel      n  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n
+PINGv6    1344      0      -1   NI       0   yes  kernel      y  y  y  n  n  y  n  n  y  y  y  y  y  y  n  y  y  n
+RAWv6     1344      0      -1   NI       0   yes  kernel      y  y  y  n  y  y  y  n  y  y  y  y  y  y  y  y  n  n
+UDPv6     1472      0       0   NI       0   yes  kernel      y  y  y  n  y  y  y  n  y  y  y  y  n  n  y  y  y  n
+TCPv6     2560      0       0   no     256   yes  kernel      y  y  y  y  y  y  y  y  y  y  y  y  n  y  y  y  y  y
+UNIX-STREAM 1088      0      -1   NI       0   yes  kernel      y  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n
+UNIX      1088      0      -1   NI       0   yes  kernel      y  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n
+PING      1040      0      -1   NI       0   yes  kernel      y  y  y  n  n  y  n  n  y  y  y  y  y  y  n  y  y  n
+RAW       1216      0      -1   NI       0   yes  kernel      y  y  y  n  y  y  y  n  y  y  y  y  y  y  y  y  n  n
+UDP       1344      0       0   NI       0   yes  kernel      y  y  y  n  y  y  y  n  y  y  y  y  n  n  y  y  y  n
+TCP       2432      0       0   no     256   yes  kernel      y  y  y  y  y  y  y  y  y  y  y  y  n  y  y  y  y  y
+NETLINK   1096      0      -1   NI       0   no   kernel      n  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n  n
+--- Running NetZero C ABI & Cycle Benchmark Suite ---
+=== Project NetZero Benchmark & ABI Verification Suite ===
+[PASS] ABI Torture 1: Multi-threaded CLONE_FILES fdget/dup2/close race (15,000 swaps)
+[PASS] ABI Torture 2: readlink(/proc/self/fd/3) -> socket:[438]
+[BENCH] L1_mt_recv_eagain       :  372.2 cycles/call |  132.8 ns/call
+[BENCH] L1_4thr_shared_fd_recv  :  137.0 ns/call-agg (800k calls across 4 cores)
+[BENCH] L1_mt_accept4_eagain    :  336.0 cycles/call |  119.9 ns/call
+[BENCH] L1_cmsg_56B_roundtrip   : 3295.2 cycles/pair | 1175.5 ns/pair
+[BENCH] L1_socket_close_pair    : 2566.7 cycles/pair |  915.6 ns/pair
+[BENCH] L2_epoll_wait_32ready   :   43.7 cycles/ev   |   15.6 ns/ev
+[PASS] ABI Torture 3: EPOLLET edge-triggered semantics verified (1 -> 0 -> 1)
+[PASS] ABI Torture 4: AF_UNIX SCM_RIGHTS causality ('AAABBBCCC') + Cyclic GC (open: 0 -> 0)
+[BENCH] L3_unix_64B_pingpong    : 14022.7 cycles/RTT  | 5002.4 ns/RTT
+[BENCH] L3_unix_4KB_throughput  :   5.41 GiB/s
+[BENCH] L3_1000_unix_socks_ram  : 4392 KiB SUnreclaim delta | unix_sock=1088 B
+[BENCH] L4_tcp_connect_storm    :  10.19 us/conn (4000 conns)
+[BENCH] L5_tcp_bulk_throughput  :   8.45 GiB/s | tcp_sock=2432 B | active_pages=0
+[BENCH] L5_udp_32sock_hoarding  :   1024 pages (4096 KiB) held for 24x1200B + 8x0B! | udp_sock=1344 B
+[BENCH] L5_udp_unconn_sendto    : 2774.9 cycles/pkt  |   1.01 Mpps
+=== All NetZero ABI & Performance Checks Completed Cleanly ===
+--- Verifying ss (NETLINK_SOCK_DIAG) Compatibility ---
+Total: 0
+TCP:   1 (estab 0, closed 1, orphaned 0, timewait 1)
+
+Transport Total     IP        IPv6
+RAW	  0         0         0        
+UDP	  0         0         0        
+TCP	  0         0         0        
+INET	  0         0         0        
+FRAG	  0         0         0        
+
+State     Recv-Q Send-Q Local Address:Port  Peer Address:Port
+TIME-WAIT 0      0          127.0.0.1:14076    127.0.0.1:11589
+Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port
+[NetZero KVM] Payload finished with exit_code=0
+[    2.086874] sysrq: Power Off
+[    2.087924] reboot: Power down

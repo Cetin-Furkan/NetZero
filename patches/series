@@ -1,0 +1,10 @@
+# Project NetZero v2 Patch Series
+# Base repository: https://github.com/torvalds/linux.git
+# Base commit: 7e1392a42ea288d70a266f6553fe06f57f8647ea (Linux 7.4-rc2 + net-7.4-rc3)
+split/01-c23-and-tigerlake-deep-isa.patch
+split/02-vfs-hazard-fdget-poll-epoll-fusion.patch
+split/03-socket-syscall-and-leaf-inet-fusion.patch
+split/04-af-unix-adaptive-2tier-ring.patch
+split/05-tcp-udp-swisstable-and-wan-lan-ecn.patch
+split/06-sch-eiffel-dualq-l4s-aqm.patch
+split/07-asoc-sof-hda-dsp-counted-by-fix.patch
