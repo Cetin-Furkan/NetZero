@@ -30,9 +30,9 @@ static int unix_msg_wait_data(struct sock *sk, struct sk_psock *psock,
 	add_wait_queue(sk_sleep(sk), &wait);
 	sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
 	if (!unix_sk_has_data(sk, psock)) {
-		mutex_unlock(&u->iolock);
+		unix_io_unlock(u);
 		wait_woken(&wait, TASK_INTERRUPTIBLE, timeo);
-		mutex_lock(&u->iolock);
+		unix_io_lock(u);
 		ret = unix_sk_has_data(sk, psock);
 	}
 	sk_clear_bit(SOCKWQ_ASYNC_WAITDATA, sk);
@@ -66,11 +66,11 @@ static int unix_bpf_recvmsg(struct sock *sk, struct msghdr *msg,
 	if (unlikely(!psock))
 		return __unix_recvmsg(sk, msg, len, flags);
 
-	mutex_lock(&u->iolock);
+	unix_io_lock(u);
 	if ((!skb_queue_empty(&sk->sk_receive_queue) ||
 	     unix_stream_ring_readable(sk)) &&
 	    sk_psock_queue_empty(psock)) {
-		mutex_unlock(&u->iolock);
+		unix_io_unlock(u);
 		sk_psock_put(sk, psock);
 		return __unix_recvmsg(sk, msg, len, flags);
 	}
@@ -86,13 +86,13 @@ msg_bytes_ready:
 		if (data) {
 			if (!sk_psock_queue_empty(psock))
 				goto msg_bytes_ready;
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 			sk_psock_put(sk, psock);
 			return __unix_recvmsg(sk, msg, len, flags);
 		}
 		copied = -EAGAIN;
 	}
-	mutex_unlock(&u->iolock);
+	unix_io_unlock(u);
 	sk_psock_put(sk, psock);
 	return copied;
 }

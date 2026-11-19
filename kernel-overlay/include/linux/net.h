@@ -342,6 +342,8 @@ struct socket *sockfd_lookup(int fd, int *err);
 struct socket *sock_from_file(struct file *file);
 ssize_t sock_read_fast(struct file *file, char __user *buf, size_t count);
 ssize_t sock_write_fast(struct file *file, const char __user *buf, size_t count);
+ssize_t sock_read_iter(struct kiocb *iocb, struct iov_iter *to);
+ssize_t sock_write_iter(struct kiocb *iocb, struct iov_iter *from);
 int sock_read_xattr(struct socket *sock, const char *name, void *value, size_t size);
 #define		     sockfd_put(sock) fput(sock->file)
 int net_ratelimit(void);

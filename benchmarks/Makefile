@@ -1,6 +1,6 @@
 CC       ?= clang
 MARCH    ?= native
-CFLAGS   := -Wall -Wextra -O3 -march=$(MARCH) -pthread
+CFLAGS   := -std=gnu2x -Wall -Wextra -Wno-unused-result -Wno-unterminated-string-initialization -O3 -march=$(MARCH) -pthread
 WL_FLAGS := $(shell pkg-config --cflags --libs wayland-client 2>/dev/null)
 
 BINS := grand_socket_bench netzero_bench wan_bloat_bench

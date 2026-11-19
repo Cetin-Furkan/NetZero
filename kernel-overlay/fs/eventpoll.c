@@ -39,7 +39,15 @@
 #include <linux/rculist.h>
 #include <linux/capability.h>
 #include <linux/seqlock.h>
+#include <linux/netzero_tigerlake.h>
 #include <net/busy_poll.h>
+#if IS_BUILTIN(CONFIG_UNIX)
+#include <net/af_unix.h>
+#endif
+#if IS_BUILTIN(CONFIG_INET)
+#include <net/tcp.h>
+#include <net/udp.h>
+#endif
 
 /*
  * fs/eventpoll.c - Efficient event polling ("epoll") kernel implementation.
@@ -223,6 +231,18 @@
 
 #define EP_UNACTIVE_PTR ((void *) -1L)
 
+enum ep_fast_fkind {
+	EP_FKIND_GENERIC = 0,
+	EP_FKIND_SOCK    = 1,
+	EP_FKIND_EVENTFD = 2,
+	EP_FKIND_PIPE    = 3,
+	EP_FKIND_TIMERFD = 4,
+	EP_FKIND_PIDFD   = 5,
+};
+
+#define EP_CTL_CACHE_BITS 4
+#define EP_CTL_CACHE_SIZE (1U << EP_CTL_CACHE_BITS)
+
 #define EP_ITEM_COST (sizeof(struct epitem) + sizeof(struct eppoll_entry))
 
 /* Wait structure used by the poll hooks */
@@ -271,6 +291,9 @@ struct epitem {
 	/* The file descriptor information this item refers to */
 	struct epoll_key ffd;
 
+	/* Pre-classified leaf kind in Cacheline 0 padding (0 extra bytes) */
+	u8 fast_file_kind;
+
 	/* List containing poll wait queues */
 	struct eppoll_entry *pwqlist;
 
@@ -318,6 +341,9 @@ struct eventpoll {
 
 	/* RB tree root used to store monitored fd structs */
 	struct rb_root_cached rbr;
+
+	/* Hardware CRC32C direct-mapped epitem lookup cache (protected by mtx) */
+	struct epitem *ctl_cache[EP_CTL_CACHE_SIZE];
 
 	/*
 	 * This is a single linked list that chains all the "struct epitem" that
@@ -548,6 +574,35 @@ static const struct file_operations eventpoll_fops;
 bool is_file_epoll(struct file *f)
 {
 	return f->f_op == &eventpoll_fops;
+}
+
+static __always_inline unsigned int ep_ctl_cache_idx(const struct epoll_key *ffd)
+{
+	return nz_hash_pair64((uintptr_t)ffd->file, (u32)ffd->fd) &
+	       (EP_CTL_CACHE_SIZE - 1);
+}
+
+static __always_inline u8 ep_classify_file_kind(const struct file *file)
+{
+	const struct file_operations *f_op = file->f_op;
+
+#ifdef CONFIG_NET
+	if (f_op == &socket_file_ops)
+		return EP_FKIND_SOCK;
+#endif
+#ifdef CONFIG_EVENTFD
+	if (f_op == &eventfd_fops)
+		return EP_FKIND_EVENTFD;
+#endif
+	if (f_op == &pipeanon_fops || f_op == &pipefifo_fops)
+		return EP_FKIND_PIPE;
+#ifdef CONFIG_TIMERFD
+	if (f_op == &timerfd_fops)
+		return EP_FKIND_TIMERFD;
+#endif
+	if (f_op == &pidfs_file_operations)
+		return EP_FKIND_PIDFD;
+	return EP_FKIND_GENERIC;
 }
 
 /* Compare RB tree keys */
@@ -994,20 +1049,23 @@ static void ep_done_scan(struct eventpoll *ep,
 	 * other events might have been queued by the poll callback.
 	 * We re-insert them inside the main ready-list here.
 	 */
-	for (nepi = READ_ONCE(ep->ovflist); (epi = nepi) != NULL; ) {
-		nepi = epi->ovflist_next;
-		epi_clear_ovflist(epi);
-		/*
-		 * Skip items that the caller already returned via @scan_batch
-		 * -- the list_splice() below takes care of those.
-		 */
-		if (!ep_is_linked(epi)) {
+	nepi = READ_ONCE(ep->ovflist);
+	if (unlikely(nepi)) {
+		for (; (epi = nepi) != NULL; ) {
+			nepi = epi->ovflist_next;
+			epi_clear_ovflist(epi);
 			/*
-			 * ovflist is LIFO; list_add() head-insert here
-			 * reverses the iteration order into FIFO.
+			 * Skip items that the caller already returned via @scan_batch
+			 * -- the list_splice() below takes care of those.
 			 */
-			list_add(&epi->rdllink, &ep->rdllist);
-			ep_pm_stay_awake(epi);
+			if (!ep_is_linked(epi)) {
+				/*
+				 * ovflist is LIFO; list_add() head-insert here
+				 * reverses the iteration order into FIFO.
+				 */
+				list_add(&epi->rdllink, &ep->rdllist);
+				ep_pm_stay_awake(epi);
+			}
 		}
 	}
 
@@ -1019,11 +1077,13 @@ static void ep_done_scan(struct eventpoll *ep,
 	/*
 	 * Quickly re-inject items left on "scan_batch".
 	 */
-	list_splice(scan_batch, &ep->rdllist);
+	if (unlikely(!list_empty(scan_batch)))
+		list_splice(scan_batch, &ep->rdllist);
 
 	write_seqcount_end(&ep->seq);
 
-	__pm_relax(ep->ws);
+	if (unlikely(ep->ws))
+		__pm_relax(ep->ws);
 
 	if (!list_empty(&ep->rdllist)) {
 		if (waitqueue_active(&ep->wq))
@@ -1126,7 +1186,13 @@ static void ep_remove_file(struct eventpoll *ep, struct epitem *epi,
 
 static void ep_remove_epi(struct eventpoll *ep, struct epitem *epi)
 {
+	unsigned int idx;
+
 	lockdep_assert_held(&ep->mtx);
+
+	idx = ep_ctl_cache_idx(&epi->ffd);
+	if (ep->ctl_cache[idx] == epi)
+		ep->ctl_cache[idx] = NULL;
 
 	rb_erase_cached(&epi->rbn, &ep->rbr);
 
@@ -1301,6 +1367,10 @@ static __poll_t __ep_eventpoll_poll(struct file *file, poll_table *wait, int dep
 	 * the ready list.
 	 */
 	mutex_lock_nested(&ep->mtx, depth);
+	if (unlikely(list_empty_careful(&ep->rdllist))) {
+		mutex_unlock(&ep->mtx);
+		return 0;
+	}
 	ep_start_scan(ep, &scan_batch);
 	list_for_each_entry_safe(epi, tmp, &scan_batch, rdllink) {
 		if (ep_item_poll(epi, &pt, depth + 1)) {
@@ -1330,20 +1400,71 @@ static __poll_t ep_item_poll(const struct epitem *epi, poll_table *pt,
 				 int depth)
 {
 	struct file *file = epi->ffd.file;
+	__poll_t events = epi->event.events;
 	__poll_t res;
 
 	/*
-	 * Fast path for sockets: caller holds ep->mtx, and __fput() blocks
-	 * in eventpoll_release_file() on ep->mtx BEFORE calling f_op->release
-	 * (sock_close). Thus as long as file_ref_read() is non-zero, @file and
-	 * its underlying struct socket remain open and pinned for the entire
-	 * vfs_poll() call without atomic file_ref_get()/fput() RMWs.
+	 * Pin-free leaf fastpath: caller holds ep->mtx, and __fput() blocks
+	 * in eventpoll_release_file() on ep->mtx BEFORE calling f_op->release.
+	 * As long as file_ref_read() is non-zero, @file and its private_data
+	 * remain open for the entire leaf poll without atomic f_ref RMWs.
 	 */
-	if (likely(sock_from_file(file))) {
+	if (likely(epi->fast_file_kind != EP_FKIND_GENERIC)) {
 		if (unlikely(!file_ref_read(&file->f_ref)))
 			return 0;
-		pt->_key = epi->event.events;
-		return vfs_poll(file, pt) & epi->event.events;
+		pt->_key = events;
+		switch (epi->fast_file_kind) {
+#ifdef CONFIG_NET
+		case EP_FKIND_SOCK: {
+			struct socket *sock = file->private_data;
+			const struct proto_ops *ops = READ_ONCE(sock->ops);
+			__poll_t (*pollfn)(struct file *, struct socket *, poll_table *);
+
+#if IS_BUILTIN(CONFIG_UNIX)
+			if (likely(ops == &unix_stream_ops)) {
+				res = poll_does_not_wait(pt) ?
+				      unix_stream_poll_nowait(sock, events) :
+				      unix_poll(file, sock, pt);
+				return res & events;
+			}
+#endif
+			pollfn = ops->poll;
+#if IS_BUILTIN(CONFIG_INET)
+			if (likely(pollfn == tcp_poll))
+				res = tcp_poll(file, sock, pt);
+			else if (pollfn == udp_poll)
+				res = udp_poll(file, sock, pt);
+			else
+#endif
+#if IS_BUILTIN(CONFIG_UNIX)
+			if (pollfn == unix_dgram_poll)
+				res = unix_dgram_poll(file, sock, pt);
+			else if (pollfn == unix_poll)
+				res = unix_poll(file, sock, pt);
+			else
+#endif
+			if (pollfn == datagram_poll)
+				res = datagram_poll(file, sock, pt);
+			else
+				res = likely(pollfn) ? pollfn(file, sock, pt) : 0;
+			return res & events;
+		}
+#endif
+#ifdef CONFIG_EVENTFD
+		case EP_FKIND_EVENTFD:
+			return eventfd_poll(file, pt) & events;
+#endif
+		case EP_FKIND_PIPE:
+			return pipe_poll(file, pt) & events;
+#ifdef CONFIG_TIMERFD
+		case EP_FKIND_TIMERFD:
+			return timerfd_poll(file, pt) & events;
+#endif
+		case EP_FKIND_PIDFD:
+			return pidfd_poll(file, pt) & events;
+		default:
+			break;
+		}
 	}
 
 	file = epi_fget(epi);
@@ -1355,13 +1476,13 @@ static __poll_t ep_item_poll(const struct epitem *epi, poll_table *pt,
 	if (!file)
 		return 0;
 
-	pt->_key = epi->event.events;
+	pt->_key = events;
 	if (!is_file_epoll(file))
 		res = vfs_poll(file, pt);
 	else
 		res = __ep_eventpoll_poll(file, pt, depth);
 	fput(file);
-	return res & epi->event.events;
+	return res & events;
 }
 
 static __poll_t ep_eventpoll_poll(struct file *file, poll_table *wait)
@@ -1480,10 +1601,20 @@ static int ep_alloc(struct eventpoll **pep)
 static struct epitem *ep_find(struct eventpoll *ep, struct epoll_key *tf)
 {
 	int kcmp;
+	unsigned int idx;
 	struct rb_node *rbp;
 	struct epitem *epi, *epir = NULL;
 
-	for (rbp = ep->rbr.rb_root.rb_node; rbp; ) {
+	rbp = ep->rbr.rb_root.rb_node;
+	if (!rbp)
+		return NULL;
+
+	idx = ep_ctl_cache_idx(tf);
+	epi = ep->ctl_cache[idx];
+	if (likely(epi && epi->ffd.file == tf->file && epi->ffd.fd == tf->fd))
+		return epi;
+
+	for (; rbp; ) {
 		epi = rb_entry(rbp, struct epitem, rbn);
 		kcmp = ep_cmp_ffd(tf, &epi->ffd);
 		if (kcmp > 0)
@@ -1492,6 +1623,7 @@ static struct epitem *ep_find(struct eventpoll *ep, struct epoll_key *tf)
 			rbp = rbp->rb_left;
 		else {
 			epir = epi;
+			ep->ctl_cache[idx] = epi;
 			break;
 		}
 	}
@@ -1854,6 +1986,7 @@ static struct epitem *ep_alloc_epitem(struct eventpoll *ep,
 	INIT_LIST_HEAD(&epi->rdllink);
 	epi->ep = ep;
 	epi->ffd = *tf;
+	epi->fast_file_kind = ep_classify_file_kind(tf->file);
 	epi->event = *event;
 	epi_clear_ovflist(epi);
 
@@ -1898,6 +2031,7 @@ static int ep_register_epitem(struct ep_ctl_ctx *ctx, struct eventpoll *ep,
 		list_file(tfile, ctx);
 
 	ep_rbtree_insert(ep, epi);
+	ep->ctl_cache[ep_ctl_cache_idx(&epi->ffd)] = epi;
 
 	if (tep)
 		mutex_unlock(&tep->mtx);
@@ -2172,6 +2306,10 @@ static int ep_send_events(struct eventpoll *ep,
 	init_poll_funcptr(&pt, NULL);
 
 	mutex_lock(&ep->mtx);
+	if (unlikely(list_empty_careful(&ep->rdllist))) {
+		mutex_unlock(&ep->mtx);
+		return 0;
+	}
 	ep_start_scan(ep, &scan_batch);
 
 	/*
@@ -2184,6 +2322,17 @@ static int ep_send_events(struct eventpoll *ep,
 
 		if (res + nbatch >= maxevents)
 			break;
+
+		if (&tmp->rdllink != &scan_batch) {
+			struct file *nfile = tmp->ffd.file;
+
+			prefetchw(tmp);
+			prefetch((const char *)tmp + 64);
+			if (likely(nfile)) {
+				prefetch(nfile);
+				prefetch(READ_ONCE(nfile->private_data));
+			}
+		}
 
 		ws = ep_wakeup_source(epi);
 		if (ws) {

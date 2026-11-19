@@ -22,6 +22,8 @@
 #include <linux/fs.h>
 #include <linux/filelock.h>
 #include <linux/net.h>
+#include <linux/eventfd.h>
+#include <linux/pipe_fs_i.h>
 #include "internal.h"
 
 #include <linux/uaccess.h>
@@ -534,6 +536,7 @@ EXPORT_SYMBOL(kernel_read);
 
 ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 {
+	const struct file_operations *f_op;
 	ssize_t ret;
 
 	if (!(file->f_mode & FMODE_READ))
@@ -549,11 +552,18 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 	if (count > MAX_RW_COUNT)
 		count =  MAX_RW_COUNT;
 
+	f_op = file->f_op;
 	if (!pos && sock_from_file(file))
 		ret = sock_read_fast(file, buf, count);
-	else if (file->f_op->read)
-		ret = file->f_op->read(file, buf, count, pos);
-	else if (file->f_op->read_iter)
+#ifdef CONFIG_EVENTFD
+	else if (f_op == &eventfd_fops)
+		ret = eventfd_read_fast(file, buf, count);
+#endif
+	else if (f_op == &pipeanon_fops || f_op == &pipefifo_fops)
+		ret = pipe_read_fast(file, buf, count);
+	else if (f_op->read)
+		ret = f_op->read(file, buf, count, pos);
+	else if (f_op->read_iter)
 		ret = new_sync_read(file, buf, count, pos);
 	else
 		ret = -EINVAL;
@@ -649,6 +659,7 @@ EXPORT_SYMBOL(kernel_write);
 
 ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
 {
+	const struct file_operations *f_op;
 	ssize_t ret;
 
 	if (!(file->f_mode & FMODE_WRITE))
@@ -664,11 +675,18 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
 	if (count > MAX_RW_COUNT)
 		count =  MAX_RW_COUNT;
 	file_start_write(file);
+	f_op = file->f_op;
 	if (!pos && sock_from_file(file))
 		ret = sock_write_fast(file, buf, count);
-	else if (file->f_op->write)
-		ret = file->f_op->write(file, buf, count, pos);
-	else if (file->f_op->write_iter)
+#ifdef CONFIG_EVENTFD
+	else if (f_op == &eventfd_fops)
+		ret = eventfd_write_fast(file, buf, count);
+#endif
+	else if (f_op == &pipeanon_fops || f_op == &pipefifo_fops)
+		ret = pipe_write_fast(file, buf, count);
+	else if (f_op->write)
+		ret = f_op->write(file, buf, count, pos);
+	else if (f_op->write_iter)
 		ret = new_sync_write(file, buf, count, pos);
 	else
 		ret = -EINVAL;
@@ -807,10 +825,21 @@ static ssize_t do_iter_readv_writev(struct file *filp, struct iov_iter *iter,
 		return ret;
 	kiocb.ki_pos = (ppos ? *ppos : 0);
 
-	if (type == READ)
-		ret = filp->f_op->read_iter(&kiocb, iter);
-	else
-		ret = filp->f_op->write_iter(&kiocb, iter);
+	if (type == READ) {
+#ifdef CONFIG_NET
+		if (filp->f_op == &socket_file_ops)
+			ret = sock_read_iter(&kiocb, iter);
+		else
+#endif
+			ret = filp->f_op->read_iter(&kiocb, iter);
+	} else {
+#ifdef CONFIG_NET
+		if (filp->f_op == &socket_file_ops)
+			ret = sock_write_iter(&kiocb, iter);
+		else
+#endif
+			ret = filp->f_op->write_iter(&kiocb, iter);
+	}
 	BUG_ON(ret == -EIOCBQUEUED);
 	if (ppos)
 		*ppos = kiocb.ki_pos;

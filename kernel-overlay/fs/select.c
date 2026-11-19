@@ -31,6 +31,9 @@
 #include <linux/hrtimer.h>
 #include <linux/freezer.h>
 #include <net/busy_poll.h>
+#if IS_BUILTIN(CONFIG_UNIX)
+#include <net/af_unix.h>
+#endif
 #include <linux/vmalloc.h>
 
 #include <linux/uaccess.h>
@@ -130,7 +133,8 @@ EXPORT_SYMBOL(poll_initwait);
 static void free_poll_entry(struct poll_table_entry *entry)
 {
 	remove_wait_queue(entry->wait_address, &entry->wait);
-	fput(entry->filp);
+	if (entry->filp)
+		fput(entry->filp);
 }
 
 void poll_freewait(struct poll_wqueues *pwq)
@@ -224,6 +228,28 @@ static void __pollwait(struct file *filp, wait_queue_head_t *wait_address,
 	if (!entry)
 		return;
 	entry->filp = get_file(filp);
+	entry->wait_address = wait_address;
+	entry->key = p->_key;
+	init_waitqueue_func_entry(&entry->wait, pollwake);
+	entry->wait.private = pwq;
+	add_wait_queue(wait_address, &entry->wait);
+}
+
+/*
+ * Pin-free variant for private fd tables (files->count == 1) in
+ * do_sys_poll_small_block(): current cannot close or clone files while
+ * inside the syscall, and poll_freewait() unregisters all waitqueues
+ * before returning to userspace.
+ */
+static void __pollwait_pinfree(struct file *filp, wait_queue_head_t *wait_address,
+			       poll_table *p)
+{
+	struct poll_wqueues *pwq = container_of(p, struct poll_wqueues, pt);
+	struct poll_table_entry *entry = poll_get_entry(pwq);
+
+	if (!entry)
+		return;
+	entry->filp = NULL;
 	entry->wait_address = wait_address;
 	entry->key = p->_key;
 	init_waitqueue_func_entry(&entry->wait, pollwake);
@@ -873,6 +899,14 @@ static inline __poll_t do_pollfd(struct pollfd *pollfd, poll_table *pwait,
 
 	/* userland u16 ->events contains POLL... bitmap */
 	filter = demangle_poll(pollfd->events) | EPOLLERR | EPOLLHUP;
+#if IS_BUILTIN(CONFIG_UNIX)
+	if (poll_does_not_wait(pwait) && fd_file(f)->f_op == &socket_file_ops) {
+		struct socket *sock = fd_file(f)->private_data;
+
+		if (likely(READ_ONCE(sock->ops) == &unix_stream_ops))
+			return unix_stream_poll_nowait(sock, filter) & filter;
+	}
+#endif
 	pwait->_key = filter | busy_flag;
 	mask = vfs_poll(fd_file(f), pwait);
 	if (mask & busy_flag)
@@ -971,30 +1005,11 @@ static int do_poll(struct poll_list *list, struct poll_wqueues *wait,
 #define N_STACK_PPS ((sizeof(stack_pps) - sizeof(struct poll_list))  / \
 			sizeof(struct pollfd))
 
-static int do_sys_poll_nowait_small(struct pollfd __user *ufds, unsigned int nfds)
+static inline int do_sys_poll_writeback(struct pollfd *pfds,
+					struct pollfd __user *ufds,
+					unsigned int nfds, int fdcount)
 {
-	struct pollfd pfds[8];
-	poll_table pt = { ._qproc = NULL };
-	__poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0;
-	bool can_busy_loop = false;
 	unsigned int i;
-	int count = 0;
-
-	if (unlikely(!nfds))
-		return unlikely(signal_pending(current)) ? -ERESTARTNOHAND : 0;
-
-	if (unlikely(copy_from_user(pfds, ufds, nfds * sizeof(struct pollfd))))
-		return -EFAULT;
-
-	for (i = 0; i < nfds; i++) {
-		__poll_t mask = do_pollfd(&pfds[i], &pt, &can_busy_loop, busy_flag);
-
-		pfds[i].revents = mangle_poll(mask);
-		if (mask) {
-			count++;
-			busy_flag = 0;
-		}
-	}
 
 	if (nfds == 1) {
 		if (unlikely(put_user(pfds[0].revents, &ufds[0].revents)))
@@ -1006,12 +1021,129 @@ static int do_sys_poll_nowait_small(struct pollfd __user *ufds, unsigned int nfd
 		}
 	}
 
-	if (!count && unlikely(signal_pending(current)))
+	if (!fdcount && unlikely(signal_pending(current)))
 		return -ERESTARTNOHAND;
-	return count;
+	return fdcount;
 
 efault_out:
 	return -EFAULT;
+}
+
+static noinline int do_sys_poll_small_block(struct pollfd *pfds,
+					    struct pollfd __user *ufds,
+					    unsigned int nfds,
+					    struct timespec64 *end_time)
+{
+	struct poll_wqueues table;
+	poll_table *pt = &table.pt;
+	ktime_t expire, *to = NULL;
+	int timed_out = 0, count = 0;
+	u64 slack = end_time ? select_estimate_accuracy(end_time) : 0;
+	__poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0;
+	unsigned long busy_start = 0;
+
+	poll_initwait(&table);
+	if (likely(atomic_read_acquire(&current->files->count) == 1))
+		pt->_qproc = __pollwait_pinfree;
+
+	for (;;) {
+		bool can_busy_loop = false;
+		unsigned int i;
+
+		for (i = 0; i < nfds; i++) {
+			__poll_t mask = do_pollfd(&pfds[i], pt, &can_busy_loop,
+						  busy_flag);
+
+			pfds[i].revents = mangle_poll(mask);
+			if (mask) {
+				count++;
+				pt->_qproc = NULL;
+				busy_flag = 0;
+				can_busy_loop = false;
+			}
+		}
+
+		pt->_qproc = NULL;
+		if (!count) {
+			count = table.error;
+			if (signal_pending(current))
+				count = -ERESTARTNOHAND;
+		}
+		if (count || timed_out)
+			break;
+
+		if (can_busy_loop && !need_resched()) {
+			if (!busy_start) {
+				busy_start = busy_loop_current_time();
+				continue;
+			}
+			if (!busy_loop_timeout(busy_start))
+				continue;
+		}
+		busy_flag = 0;
+
+		if (end_time && !to) {
+			expire = timespec64_to_ktime(*end_time);
+			to = &expire;
+		}
+
+		if (!poll_schedule_timeout(&table, TASK_INTERRUPTIBLE, to, slack))
+			timed_out = 1;
+	}
+
+	poll_freewait(&table);
+	return do_sys_poll_writeback(pfds, ufds, nfds, count);
+}
+
+static noinline int do_sys_poll_slow(struct pollfd __user *ufds,
+				     unsigned int nfds,
+				     struct timespec64 *end_time);
+
+/*
+ * NetZero v3 Two-Stage Small Poll (nfds <= 8):
+ * Stage 1 probes readiness with _qproc = NULL using only a 64B stack array
+ * and per-FD hazard/borrowed lookup (0 waitqueue spinlocks, 0 poll_wqueues,
+ * 0 atomic f_ref RMWs). Returns immediately if any FD is already ready or
+ * timeout == 0; otherwise transitions cleanly to Stage 2 blocking wait.
+ */
+static int do_sys_poll_small(struct pollfd __user *ufds, unsigned int nfds,
+			     struct timespec64 *end_time)
+{
+	struct pollfd pfds[8];
+	poll_table pt = { ._qproc = NULL };
+	__poll_t busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0;
+	bool nowait = end_time && !end_time->tv_sec && !end_time->tv_nsec;
+	bool can_busy_loop = false;
+	unsigned int i;
+	int count = 0;
+
+	if (unlikely(!nfds)) {
+		if (nowait)
+			return unlikely(signal_pending(current)) ? -ERESTARTNOHAND : 0;
+		return do_sys_poll_slow(ufds, 0, end_time);
+	}
+
+	if (unlikely(copy_from_user(pfds, ufds, nfds * sizeof(struct pollfd))))
+		return -EFAULT;
+
+	for (i = 0; i < nfds; i++) {
+		__poll_t mask = do_pollfd(&pfds[i], &pt, &can_busy_loop, busy_flag);
+
+		pfds[i].revents = mangle_poll(mask);
+		if (mask) {
+			count++;
+			busy_flag = 0;
+			can_busy_loop = false;
+		}
+	}
+
+	if (likely(count > 0 || nowait))
+		return do_sys_poll_writeback(pfds, ufds, nfds, count);
+
+	if (unlikely(signal_pending(current)))
+		return do_sys_poll_writeback(pfds, ufds, nfds, -ERESTARTNOHAND);
+
+	return do_sys_poll_small_block(pfds, ufds, nfds, end_time);
 }
 
 static noinline int do_sys_poll_slow(struct pollfd __user *ufds,
@@ -1087,11 +1219,11 @@ static int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
 		return -EINVAL;
 
 	/*
-	 * NetZero v2: Bypass 1.1 KiB poll_wqueues + stack_pps allocation/zeroing
-	 * and linked-list walking on non-blocking readiness probes (nfds <= 8).
+	 * NetZero v3: Two-stage ready-first small poll (nfds <= 8) covering both
+	 * non-blocking and blocking poll()/ppoll() calls (GLib/GTK4/Wayland/D-Bus).
 	 */
-	if (nfds <= 8 && end_time && !end_time->tv_sec && !end_time->tv_nsec)
-		return do_sys_poll_nowait_small(ufds, nfds);
+	if (likely(nfds <= 8))
+		return do_sys_poll_small(ufds, nfds, end_time);
 
 	return do_sys_poll_slow(ufds, nfds, end_time);
 }

@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -16,12 +17,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <linux/io_uring.h>
+#include <linux/futex.h>
 #include <time.h>
 #include <unistd.h>
 #include <x86intrin.h>
@@ -58,6 +64,138 @@ static void pin_cpu(int cpu)
 	sched_setaffinity(0, sizeof(set), &set);
 }
 
+static void unpin_all_cpus(void)
+{
+	int ncpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
+	if (ncpus <= 0)
+		return;
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	for (int i = 0; i < ncpus; i++)
+		CPU_SET(i, &set);
+	sched_setaffinity(0, sizeof(set), &set);
+}
+
+struct gb_futex_lock {
+	_Atomic uint32_t state;
+	uint8_t pad[60];
+};
+
+struct gb_fcont_ctx {
+	struct gb_futex_lock *locks;
+	int nlocks;
+	int iters;
+};
+
+static void *gb_futex_cont_worker(void *arg)
+{
+	struct gb_fcont_ctx *c = arg;
+	unpin_all_cpus();
+	for (int i = 0; i < c->iters; i++) {
+		struct gb_futex_lock *lk = &c->locks[(i * 7) & (c->nlocks - 1)];
+		uint32_t expected = 0;
+		if (!atomic_compare_exchange_strong_explicit(&lk->state, &expected, 1,
+				memory_order_acquire, memory_order_relaxed)) {
+			if (expected != 2)
+				expected = atomic_exchange_explicit(&lk->state, 2, memory_order_acquire);
+			while (expected != 0) {
+				syscall(SYS_futex, (uint32_t *)&lk->state, FUTEX_WAIT_PRIVATE, 2, NULL, NULL, 0);
+				expected = atomic_exchange_explicit(&lk->state, 2, memory_order_acquire);
+			}
+		}
+		__asm__ __volatile__("" ::: "memory");
+		if (atomic_fetch_sub_explicit(&lk->state, 1, memory_order_release) != 1) {
+			atomic_store_explicit(&lk->state, 0, memory_order_release);
+			syscall(SYS_futex, (uint32_t *)&lk->state, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+		}
+	}
+	return NULL;
+}
+
+struct gb_unpinned_pp_ctx {
+	int rx_fd;
+	int tx_fd;
+	int iters;
+};
+
+static void *gb_unpinned_efd_worker(void *arg)
+{
+	struct gb_unpinned_pp_ctx *c = arg;
+	unpin_all_cpus();
+	uint64_t val = 1;
+	for (int i = 0; i < c->iters; i++) {
+		if (read(c->rx_fd, &val, 8) != 8)
+			break;
+		val = 1;
+		if (write(c->tx_fd, &val, 8) != 8)
+			break;
+	}
+	return NULL;
+}
+
+static void *gb_unpinned_pipe_worker(void *arg)
+{
+	struct gb_unpinned_pp_ctx *c = arg;
+	unpin_all_cpus();
+	char buf[64];
+	for (int i = 0; i < c->iters; i++) {
+		if (read(c->rx_fd, buf, 64) != 64)
+			break;
+		if (write(c->tx_fd, buf, 64) != 64)
+			break;
+	}
+	return NULL;
+}
+
+static atomic_int gb_hog_stop = 0;
+static void *gb_cpu_hog_worker(void *arg)
+{
+	(void)arg;
+	unpin_all_cpus();
+	uint64_t v = 0x9e3779b97f4a7c15ULL;
+	while (!atomic_load_explicit(&gb_hog_stop, memory_order_relaxed)) {
+		for (int i = 0; i < 4096; i++)
+			v = v * 6364136223846793005ULL + 1ULL;
+	}
+	if (v == 0)
+		fprintf(stderr, "%lu", (unsigned long)v);
+	return NULL;
+}
+
+struct gb_bore_ctx {
+	int req_efd;
+	int ack_efd;
+	int frames;
+	uint64_t *lats;
+	_Atomic uint64_t *send_ts;
+};
+
+static void *gb_bore_responder(void *arg)
+{
+	struct gb_bore_ctx *b = arg;
+	unpin_all_cpus();
+	for (int i = 0; i < b->frames; i++) {
+		uint64_t v = 0;
+		if (read(b->req_efd, &v, 8) != 8)
+			break;
+		uint64_t tw = nsec_now();
+		uint64_t ts = atomic_load_explicit(b->send_ts, memory_order_acquire);
+		b->lats[i] = tw > ts ? (tw - ts) : 0;
+		while (nsec_now() - tw < 40000ULL)
+			_mm_pause();
+		v = 1;
+		if (write(b->ack_efd, &v, 8) != 8)
+			break;
+	}
+	return NULL;
+}
+
+static int gb_cmp_u64(const void *a, const void *b)
+{
+	uint64_t va = *(const uint64_t *)a, vb = *(const uint64_t *)b;
+	return (va > vb) - (va < vb);
+}
+
 static void raise_nofile_limit(void)
 {
 	struct rlimit rl;
@@ -70,12 +208,14 @@ static void raise_nofile_limit(void)
 	}
 }
 
+static int g_trial_offset = 0;
+
 static void emit_sample(const char *suite, const char *metric, int trial,
 			double val, const char *unit, const char *better)
 {
 	printf("{\"suite\":\"%s\",\"metric\":\"%s\",\"trial\":%d,\"value\":%.6f,"
 	       "\"unit\":\"%s\",\"better\":\"%s\"}\n",
-	       suite, metric, trial, val, unit, better);
+	       suite, metric, trial + g_trial_offset, val, unit, better);
 	fflush(stdout);
 }
 
@@ -228,6 +368,177 @@ static void *shared_fd_worker(void *arg)
 		ssize_t r = recv(c->fd, buf, sizeof(buf), MSG_DONTWAIT);
 		(void)r;
 	}
+	return NULL;
+}
+
+struct efd_pp_ctx {
+	int rx_fd;
+	int tx_fd;
+	int iters;
+	int cpu;
+};
+
+static void *eventfd_pong_worker(void *arg)
+{
+	struct efd_pp_ctx *c = (struct efd_pp_ctx *)arg;
+	pin_cpu(c->cpu);
+	uint64_t v = 0, one = 1;
+	for (int i = 0; i < c->iters; i++) {
+		if (read(c->rx_fd, &v, sizeof(v)) != (ssize_t)sizeof(v))
+			break;
+		if (write(c->tx_fd, &one, sizeof(one)) != (ssize_t)sizeof(one))
+			break;
+	}
+	return NULL;
+}
+
+static void *pipe_64b_pong_worker(void *arg)
+{
+	struct efd_pp_ctx *c = (struct efd_pp_ctx *)arg;
+	pin_cpu(c->cpu);
+	char buf[64];
+	for (int i = 0; i < c->iters; i++) {
+		size_t got = 0;
+		while (got < 64) {
+			ssize_t r = read(c->rx_fd, buf + got, 64 - got);
+			if (r <= 0)
+				return NULL;
+			got += (size_t)r;
+		}
+		size_t sent = 0;
+		while (sent < 64) {
+			ssize_t w = write(c->tx_fd, buf + sent, 64 - sent);
+			if (w <= 0)
+				return NULL;
+			sent += (size_t)w;
+		}
+	}
+	return NULL;
+}
+
+struct poll_pp_ctx {
+	int sock_fd;
+	int idle_efd;
+	int iters;
+	int cpu;
+};
+
+static void *poll_2fd_pong_worker(void *arg)
+{
+	struct poll_pp_ctx *c = (struct poll_pp_ctx *)arg;
+	pin_cpu(c->cpu);
+	struct pollfd pfds[2] = {
+		{ .fd = c->idle_efd, .events = POLLIN },
+		{ .fd = c->sock_fd,  .events = POLLIN },
+	};
+	char buf[64];
+	for (int i = 0; i < c->iters; i++) {
+		if (poll(pfds, 2, -1) <= 0)
+			break;
+		if (recv(c->sock_fd, buf, 64, MSG_DONTWAIT) != 64)
+			break;
+		if (send(c->sock_fd, buf, 64, MSG_NOSIGNAL) != 64)
+			break;
+	}
+	return NULL;
+}
+
+struct gb_uring {
+	int ring_fd;
+	void *sq_ring, *cq_ring;
+	size_t sq_ring_sz, cq_ring_sz, sqes_sz;
+	struct io_uring_sqe *sqes;
+	uint32_t *sq_tail, *sq_mask, *sq_array;
+	uint32_t *cq_head, *cq_tail, *cq_mask;
+	struct io_uring_cqe *cqes;
+};
+
+static int gb_uring_init(struct gb_uring *u, uint32_t entries)
+{
+	struct io_uring_params p;
+	memset(&p, 0, sizeof(p));
+	memset(u, 0, sizeof(*u));
+	int fd = (int)syscall(__NR_io_uring_setup, entries, &p);
+	if (fd < 0)
+		return -1;
+	u->ring_fd = fd;
+	u->sq_ring_sz = p.sq_off.array + p.sq_entries * sizeof(uint32_t);
+	u->cq_ring_sz = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
+	u->sqes_sz = p.sq_entries * sizeof(struct io_uring_sqe);
+	u->sq_ring = mmap(NULL, u->sq_ring_sz, PROT_READ | PROT_WRITE,
+			  MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
+	if (u->sq_ring == MAP_FAILED) {
+		close(fd);
+		return -1;
+	}
+	if (p.features & IORING_FEAT_SINGLE_MMAP) {
+		u->cq_ring = u->sq_ring;
+	} else {
+		u->cq_ring = mmap(NULL, u->cq_ring_sz, PROT_READ | PROT_WRITE,
+				  MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
+	}
+	u->sqes = mmap(NULL, u->sqes_sz, PROT_READ | PROT_WRITE,
+		       MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
+	u->sq_tail  = (uint32_t *)((char *)u->sq_ring + p.sq_off.tail);
+	u->sq_mask  = (uint32_t *)((char *)u->sq_ring + p.sq_off.ring_mask);
+	u->sq_array = (uint32_t *)((char *)u->sq_ring + p.sq_off.array);
+	u->cq_head  = (uint32_t *)((char *)u->cq_ring + p.cq_off.head);
+	u->cq_tail  = (uint32_t *)((char *)u->cq_ring + p.cq_off.tail);
+	u->cq_mask  = (uint32_t *)((char *)u->cq_ring + p.cq_off.ring_mask);
+	u->cqes     = (struct io_uring_cqe *)((char *)u->cq_ring + p.cq_off.cqes);
+	return 0;
+}
+
+static void gb_uring_destroy(struct gb_uring *u)
+{
+	if (u->cq_ring && u->cq_ring != u->sq_ring)
+		munmap(u->cq_ring, u->cq_ring_sz);
+	if (u->sq_ring)
+		munmap(u->sq_ring, u->sq_ring_sz);
+	if (u->sqes)
+		munmap(u->sqes, u->sqes_sz);
+	if (u->ring_fd >= 0)
+		close(u->ring_fd);
+}
+
+static inline void gb_uring_push_sr(struct gb_uring *u, uint8_t opcode, int fd,
+				    void *buf, uint32_t len, uint64_t ud)
+{
+	uint32_t tail = *u->sq_tail;
+	uint32_t idx = tail & *u->sq_mask;
+	struct io_uring_sqe *sqe = &u->sqes[idx];
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->opcode = opcode;
+	sqe->fd = fd;
+	sqe->addr = (uintptr_t)buf;
+	sqe->len = len;
+	sqe->user_data = ud;
+	u->sq_array[idx] = idx;
+	__atomic_store_n(u->sq_tail, tail + 1, __ATOMIC_RELEASE);
+}
+
+static void *iouring_pong_worker(void *arg)
+{
+	struct efd_pp_ctx *c = (struct efd_pp_ctx *)arg;
+	pin_cpu(c->cpu);
+	struct gb_uring u;
+	if (gb_uring_init(&u, 16) != 0)
+		return NULL;
+	char buf[64];
+	for (int i = 0; i < c->iters; i++) {
+		gb_uring_push_sr(&u, IORING_OP_RECV, c->rx_fd, buf, 64, 1);
+		if (syscall(__NR_io_uring_enter, u.ring_fd, 1, 1,
+			    IORING_ENTER_GETEVENTS, NULL, 0) < 0)
+			break;
+		__atomic_store_n(u.cq_head, *u.cq_head + 1, __ATOMIC_RELEASE);
+
+		gb_uring_push_sr(&u, IORING_OP_SEND, c->rx_fd, buf, 64, 2);
+		if (syscall(__NR_io_uring_enter, u.ring_fd, 1, 1,
+			    IORING_ENTER_GETEVENTS, NULL, 0) < 0)
+			break;
+		__atomic_store_n(u.cq_head, *u.cq_head + 1, __ATOMIC_RELEASE);
+	}
+	gb_uring_destroy(&u);
 	return NULL;
 }
 
@@ -440,6 +751,405 @@ static void run_suite2_vfs_epoll(int trials)
 		}
 		free(ep_sv);
 	}
+
+	// 2H: 2-thread eventfd wakeup ping-pong (PipeWire/GNOME pattern, 100,000 RTTs/trial)
+	{
+		const int N_EFD = 100000;
+		for (int t = 0; t < trials; t++) {
+			int e_a2b = eventfd(0, EFD_CLOEXEC);
+			int e_b2a = eventfd(0, EFD_CLOEXEC);
+			struct efd_pp_ctx ectx = {
+				.rx_fd = e_a2b, .tx_fd = e_b2a,
+				.iters = N_EFD + 2000, .cpu = 2
+			};
+			pthread_t th;
+			pthread_create(&th, NULL, eventfd_pong_worker, &ectx);
+			pin_cpu(0);
+
+			uint64_t one = 1, v = 0;
+			for (int i = 0; i < 2000; i++) {
+				if (write(e_a2b, &one, 8) != 8)
+					break;
+				if (read(e_b2a, &v, 8) != 8)
+					break;
+			}
+			uint64_t t0 = nsec_now();
+			for (int i = 0; i < N_EFD; i++) {
+				if (write(e_a2b, &one, 8) != 8)
+					break;
+				if (read(e_b2a, &v, 8) != 8)
+					break;
+			}
+			uint64_t t1 = nsec_now();
+			pthread_join(th, NULL);
+			close(e_a2b);
+			close(e_b2a);
+			emit_sample("S2_VFS_Epoll", "eventfd_pingpong_ns", t,
+				    (double)(t1 - t0) / N_EFD, "ns/RTT", "lower");
+		}
+	}
+
+	// 2I: 2-thread 64B pipe2 ping-pong (100,000 RTTs/trial)
+	{
+		const int N_PIPE = 100000;
+		for (int t = 0; t < trials; t++) {
+			int p_a2b[2], p_b2a[2];
+			if (pipe2(p_a2b, O_CLOEXEC) != 0 || pipe2(p_b2a, O_CLOEXEC) != 0)
+				continue;
+			struct efd_pp_ctx pctx = {
+				.rx_fd = p_a2b[0], .tx_fd = p_b2a[1],
+				.iters = N_PIPE + 2000, .cpu = 2
+			};
+			pthread_t th;
+			pthread_create(&th, NULL, pipe_64b_pong_worker, &pctx);
+			pin_cpu(0);
+
+			char buf[64];
+			memset(buf, 0x5A, sizeof(buf));
+			for (int i = 0; i < 2000; i++) {
+				if (write(p_a2b[1], buf, 64) != 64)
+					break;
+				size_t got = 0;
+				while (got < 64) {
+					ssize_t r = read(p_b2a[0], buf + got, 64 - got);
+					if (r <= 0)
+						break;
+					got += (size_t)r;
+				}
+			}
+			uint64_t t0 = nsec_now();
+			for (int i = 0; i < N_PIPE; i++) {
+				if (write(p_a2b[1], buf, 64) != 64)
+					break;
+				size_t got = 0;
+				while (got < 64) {
+					ssize_t r = read(p_b2a[0], buf + got, 64 - got);
+					if (r <= 0)
+						break;
+					got += (size_t)r;
+				}
+			}
+			uint64_t t1 = nsec_now();
+			pthread_join(th, NULL);
+			close(p_a2b[0]);
+			close(p_a2b[1]);
+			close(p_b2a[0]);
+			close(p_b2a[1]);
+			emit_sample("S2_VFS_Epoll", "pipe_64B_pingpong_ns", t,
+				    (double)(t1 - t0) / N_PIPE, "ns/RTT", "lower");
+		}
+	}
+
+	// 2J: Milestone 2 GLib/GTK4 Ready-First Blocking ppoll() on 4 FDs (500,000 calls/trial)
+	{
+		int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+		int p[2], wsv[2], dsv[2];
+		if (efd >= 0 && pipe2(p, O_NONBLOCK | O_CLOEXEC) == 0 &&
+		    socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, wsv) == 0 &&
+		    socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, dsv) == 0) {
+			send(wsv[1], "W", 1, 0);
+			struct pollfd pfds[4] = {
+				{ .fd = efd,    .events = POLLIN },
+				{ .fd = p[0],   .events = POLLIN },
+				{ .fd = wsv[0], .events = POLLIN },
+				{ .fd = dsv[0], .events = POLLIN },
+			};
+			struct timespec ts = { .tv_sec = 10, .tv_nsec = 0 };
+			const int N_PP4 = 500000;
+			pin_cpu(0);
+			for (int i = 0; i < 5000; i++)
+				ppoll(pfds, 4, &ts, NULL);
+			for (int t = 0; t < trials; t++) {
+				uint64_t t0 = nsec_now();
+				for (int i = 0; i < N_PP4; i++)
+					ppoll(pfds, 4, &ts, NULL);
+				uint64_t t1 = nsec_now();
+				emit_sample("S2_VFS_Epoll", "ppoll_4fd_ready_ns", t,
+					    (double)(t1 - t0) / N_PP4, "ns/call", "lower");
+			}
+			close(dsv[0]); close(dsv[1]);
+			close(wsv[0]); close(wsv[1]);
+			close(p[0]);   close(p[1]);
+			close(efd);
+		}
+	}
+
+	// 2K: Milestone 2 2-thread Blocking poll(2 FDs) + AF_UNIX 64B Ping-Pong (80,000 RTTs/trial)
+	{
+		const int N_POLL_PP = 80000;
+		for (int t = 0; t < trials; t++) {
+			int psv[2];
+			int efd_a = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+			int efd_b = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+			if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, psv) != 0)
+				continue;
+			struct poll_pp_ctx pctx = {
+				.sock_fd = psv[1], .idle_efd = efd_b,
+				.iters = N_POLL_PP + 1000, .cpu = 2
+			};
+			pthread_t th;
+			pthread_create(&th, NULL, poll_2fd_pong_worker, &pctx);
+			pin_cpu(0);
+			struct pollfd pfds[2] = {
+				{ .fd = efd_a,  .events = POLLIN },
+				{ .fd = psv[0], .events = POLLIN },
+			};
+			char buf[64];
+			memset(buf, 0x44, sizeof(buf));
+			for (int i = 0; i < 1000; i++) {
+				send(psv[0], buf, 64, MSG_NOSIGNAL);
+				poll(pfds, 2, -1);
+				recv(psv[0], buf, 64, MSG_DONTWAIT);
+			}
+			uint64_t t0 = nsec_now();
+			for (int i = 0; i < N_POLL_PP; i++) {
+				send(psv[0], buf, 64, MSG_NOSIGNAL);
+				poll(pfds, 2, -1);
+				recv(psv[0], buf, 64, MSG_DONTWAIT);
+			}
+			uint64_t t1 = nsec_now();
+			pthread_join(th, NULL);
+			close(efd_a); close(efd_b);
+			close(psv[0]); close(psv[1]);
+			emit_sample("S2_VFS_Epoll", "poll_2fd_pingpong_ns", t,
+				    (double)(t1 - t0) / N_POLL_PP, "ns/RTT", "lower");
+		}
+	}
+
+	// 2L: Milestone 2 Hardware CRC32C epoll_ctl(MOD) on Active Set in 1,024-FD Epoll (400,000 ops/trial)
+	{
+		int ep = epoll_create1(EPOLL_CLOEXEC);
+		int (*ep_sv)[2] = malloc(sizeof(int[2]) * 1024);
+		for (int i = 0; i < 1024; i++) {
+			socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, ep_sv[i]);
+			struct epoll_event ev = { .events = EPOLLIN | EPOLLONESHOT, .data.u32 = (uint32_t)i };
+			epoll_ctl(ep, EPOLL_CTL_ADD, ep_sv[i][0], &ev);
+		}
+		const int N_MOD = 400000;
+		pin_cpu(0);
+		struct epoll_event ev = { .events = EPOLLIN | EPOLLONESHOT, .data.u32 = 0 };
+		for (int i = 0; i < 4096; i++)
+			epoll_ctl(ep, EPOLL_CTL_MOD, ep_sv[i & 7][0], &ev);
+		for (int t = 0; t < trials; t++) {
+			uint64_t t0 = nsec_now();
+			for (int i = 0; i < N_MOD; i++) {
+				int idx = i & 7; /* 8 active connections inside 1,024-FD epoll */
+				ev.events = (i & 8) ? (EPOLLIN | EPOLLOUT | EPOLLONESHOT) : (EPOLLIN | EPOLLONESHOT);
+				ev.data.u32 = (uint32_t)idx;
+				epoll_ctl(ep, EPOLL_CTL_MOD, ep_sv[idx][0], &ev);
+			}
+			uint64_t t1 = nsec_now();
+			emit_sample("S2_VFS_Epoll", "epoll_ctl_mod_1024fd_ns", t,
+				    (double)(t1 - t0) / N_MOD, "ns/op", "lower");
+		}
+		close(ep);
+		for (int i = 0; i < 1024; i++) {
+			close(ep_sv[i][0]);
+			close(ep_sv[i][1]);
+		}
+		free(ep_sv);
+	}
+
+	// 2M & 2N: Milestone 2 Unboxed io_uring AF_UNIX 64B Ping-Pong & Batch-32 Throughput
+	{
+		struct gb_uring u;
+		if (gb_uring_init(&u, 128) == 0) {
+			const int N_UPP = 60000;
+			for (int t = 0; t < trials; t++) {
+				int usv[2];
+				if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, usv) != 0)
+					continue;
+				struct efd_pp_ctx uctx = {
+					.rx_fd = usv[1], .tx_fd = usv[1],
+					.iters = N_UPP + 1000, .cpu = 2
+				};
+				pthread_t th;
+				pthread_create(&th, NULL, iouring_pong_worker, &uctx);
+				pin_cpu(0);
+				char buf[64];
+				memset(buf, 0x66, sizeof(buf));
+				for (int i = 0; i < 1000; i++) {
+					gb_uring_push_sr(&u, IORING_OP_SEND, usv[0], buf, 64, 1);
+					syscall(__NR_io_uring_enter, u.ring_fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+					__atomic_store_n(u.cq_head, *u.cq_head + 1, __ATOMIC_RELEASE);
+					gb_uring_push_sr(&u, IORING_OP_RECV, usv[0], buf, 64, 2);
+					syscall(__NR_io_uring_enter, u.ring_fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+					__atomic_store_n(u.cq_head, *u.cq_head + 1, __ATOMIC_RELEASE);
+				}
+				uint64_t t0 = nsec_now();
+				for (int i = 0; i < N_UPP; i++) {
+					gb_uring_push_sr(&u, IORING_OP_SEND, usv[0], buf, 64, 1);
+					syscall(__NR_io_uring_enter, u.ring_fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+					__atomic_store_n(u.cq_head, *u.cq_head + 1, __ATOMIC_RELEASE);
+					gb_uring_push_sr(&u, IORING_OP_RECV, usv[0], buf, 64, 2);
+					syscall(__NR_io_uring_enter, u.ring_fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+					__atomic_store_n(u.cq_head, *u.cq_head + 1, __ATOMIC_RELEASE);
+				}
+				uint64_t t1 = nsec_now();
+				pthread_join(th, NULL);
+				close(usv[0]); close(usv[1]);
+				emit_sample("S2_VFS_Epoll", "iouring_unix_64B_pingpong_ns", t,
+					    (double)(t1 - t0) / N_UPP, "ns/RTT", "lower");
+			}
+
+			int bsv[2];
+			if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, bsv) == 0) {
+				char tx[64], rx[64];
+				memset(tx, 0x77, sizeof(tx));
+				const int ROUNDS = 5000; /* 5000 * 64 = 320,000 SQEs/trial */
+				pin_cpu(0);
+				for (int t = 0; t < trials; t++) {
+					uint64_t t0 = nsec_now();
+					for (int r = 0; r < ROUNDS; r++) {
+						for (int k = 0; k < 32; k++)
+							gb_uring_push_sr(&u, IORING_OP_SEND, bsv[0], tx, 64, (uint64_t)k);
+						for (int k = 0; k < 32; k++)
+							gb_uring_push_sr(&u, IORING_OP_RECV, bsv[1], rx, 64, (uint64_t)(32 + k));
+						syscall(__NR_io_uring_enter, u.ring_fd, 64, 64,
+							IORING_ENTER_GETEVENTS, NULL, 0);
+						__atomic_store_n(u.cq_head, *u.cq_head + 64, __ATOMIC_RELEASE);
+					}
+					uint64_t t1 = nsec_now();
+					double mops = ((double)(ROUNDS * 64) / 1e6) / ((double)(t1 - t0) / 1e9);
+					emit_sample("S2_VFS_Epoll", "iouring_unix_batch32_mops", t,
+						    mops, "Mops/s", "higher");
+				}
+				close(bsv[0]); close(bsv[1]);
+			}
+			gb_uring_destroy(&u);
+		}
+	}
+
+	// 2O: Milestone 3 Hardware CRC32Q Futex (FUTEX_WAKE_PRIVATE key+hash fastpath & 8-thread contention)
+	{
+		alignas(64) uint32_t fwords[64] = {0};
+		const int N_FWAKE = 500000;
+		pin_cpu(0);
+		for (int t = 0; t < trials; t++) {
+			uint64_t t0 = nsec_now();
+			for (int i = 0; i < N_FWAKE; i++)
+				syscall(SYS_futex, &fwords[i & 63], FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+			uint64_t t1 = nsec_now();
+			emit_sample("S2_VFS_Epoll", "futex_private_wake_ns", t,
+				    (double)(t1 - t0) / N_FWAKE, "ns/op", "lower");
+		}
+
+		const int NLOCKS = 16, NTHR = 8, ITERS = 40000;
+		struct gb_futex_lock *locks = aligned_alloc(64, sizeof(*locks) * NLOCKS);
+		unpin_all_cpus();
+		for (int t = 0; t < trials; t++) {
+			memset(locks, 0, sizeof(*locks) * NLOCKS);
+			struct gb_fcont_ctx fctx = { .locks = locks, .nlocks = NLOCKS, .iters = ITERS };
+			pthread_t th[NTHR];
+			uint64_t t0 = nsec_now();
+			for (int i = 0; i < NTHR; i++)
+				pthread_create(&th[i], NULL, gb_futex_cont_worker, &fctx);
+			for (int i = 0; i < NTHR; i++)
+				pthread_join(th[i], NULL);
+			uint64_t t1 = nsec_now();
+			double mops = ((double)(NTHR * ITERS) / 1e6) / ((double)(t1 - t0) / 1e9);
+			emit_sample("S2_VFS_Epoll", "futex_8thread_contended_mops", t,
+				    mops, "Mops/s", "higher");
+		}
+		free(locks);
+	}
+
+	// 2P: Milestone 3 Unpinned WF_SYNC Same-Core Desktop IPC Handoff (eventfd & pipe 64B)
+	{
+		const int N_UP = 80000;
+		unpin_all_cpus();
+		for (int t = 0; t < trials; t++) {
+			int e1 = eventfd(0, EFD_CLOEXEC), e2 = eventfd(0, EFD_CLOEXEC);
+			struct gb_unpinned_pp_ctx ectx = { .rx_fd = e1, .tx_fd = e2, .iters = N_UP + 1000 };
+			pthread_t th;
+			pthread_create(&th, NULL, gb_unpinned_efd_worker, &ectx);
+			unpin_all_cpus();
+			uint64_t val = 1;
+			for (int i = 0; i < 1000; i++) {
+				write(e1, &val, 8);
+				read(e2, &val, 8);
+			}
+			uint64_t t0 = nsec_now();
+			for (int i = 0; i < N_UP; i++) {
+				val = 1;
+				write(e1, &val, 8);
+				read(e2, &val, 8);
+			}
+			uint64_t t1 = nsec_now();
+			pthread_join(th, NULL);
+			close(e1); close(e2);
+			emit_sample("S2_VFS_Epoll", "wfsync_eventfd_unpinned_ns", t,
+				    (double)(t1 - t0) / N_UP, "ns/RTT", "lower");
+		}
+
+		for (int t = 0; t < trials; t++) {
+			int p1[2], p2[2];
+			if (pipe2(p1, O_CLOEXEC) != 0 || pipe2(p2, O_CLOEXEC) != 0)
+				continue;
+			struct gb_unpinned_pp_ctx pctx = { .rx_fd = p1[0], .tx_fd = p2[1], .iters = N_UP + 1000 };
+			pthread_t th;
+			pthread_create(&th, NULL, gb_unpinned_pipe_worker, &pctx);
+			unpin_all_cpus();
+			char buf[64];
+			memset(buf, 0x5a, sizeof(buf));
+			for (int i = 0; i < 1000; i++) {
+				write(p1[1], buf, 64);
+				read(p2[0], buf, 64);
+			}
+			uint64_t t0 = nsec_now();
+			for (int i = 0; i < N_UP; i++) {
+				write(p1[1], buf, 64);
+				read(p2[0], buf, 64);
+			}
+			uint64_t t1 = nsec_now();
+			pthread_join(th, NULL);
+			close(p1[0]); close(p1[1]);
+			close(p2[0]); close(p2[1]);
+			emit_sample("S2_VFS_Epoll", "wfsync_pipe64B_unpinned_ns", t,
+				    (double)(t1 - t0) / N_UP, "ns/RTT", "lower");
+		}
+	}
+
+	// 2Q: Milestone 3 BORE-EEVDF Interactive Wakeup Latency Under 8-Thread CPU Hog Load
+	{
+		const int NHOGS = 8, FRAMES = 120;
+		pthread_t hogs[NHOGS];
+		unpin_all_cpus();
+		atomic_store(&gb_hog_stop, 0);
+		for (int i = 0; i < NHOGS; i++)
+			pthread_create(&hogs[i], NULL, gb_cpu_hog_worker, NULL);
+		usleep(20000); /* Let hogs accumulate >= 4 ms burst_ns */
+
+		for (int t = 0; t < trials; t++) {
+			int req_efd = eventfd(0, EFD_CLOEXEC), ack_efd = eventfd(0, EFD_CLOEXEC);
+			uint64_t lats[FRAMES];
+			_Atomic uint64_t send_ts = 0;
+			struct gb_bore_ctx bctx = {
+				.req_efd = req_efd, .ack_efd = ack_efd,
+				.frames = FRAMES, .lats = lats, .send_ts = &send_ts
+			};
+			pthread_t rth;
+			pthread_create(&rth, NULL, gb_bore_responder, &bctx);
+			for (int i = 0; i < FRAMES; i++) {
+				usleep(600);
+				atomic_store_explicit(&send_ts, nsec_now(), memory_order_release);
+				uint64_t v = 1;
+				write(req_efd, &v, 8);
+				read(ack_efd, &v, 8);
+			}
+			pthread_join(rth, NULL);
+			close(req_efd); close(ack_efd);
+			qsort(lats, FRAMES, sizeof(uint64_t), gb_cmp_u64);
+			emit_sample("S2_VFS_Epoll", "bore_interactive_8hog_p50_us", t,
+				    (double)lats[FRAMES / 2] / 1000.0, "us", "lower");
+			emit_sample("S2_VFS_Epoll", "bore_interactive_8hog_p99_us", t,
+				    (double)lats[(FRAMES * 99) / 100] / 1000.0, "us", "lower");
+		}
+
+		atomic_store(&gb_hog_stop, 1);
+		for (int i = 0; i < NHOGS; i++)
+			pthread_join(hogs[i], NULL);
+	}
 }
 
 // ============================================================================
@@ -539,6 +1249,100 @@ static void *comp_client_thread(void *arg)
 				return NULL;
 			got += (size_t)r;
 		}
+	}
+	return NULL;
+}
+
+static int send_dbus_3iov(int fd, const void *hdr16, const void *fld48, const void *body128)
+{
+	struct iovec iov[3] = {
+		{ .iov_base = (void *)hdr16,   .iov_len = 16  },
+		{ .iov_base = (void *)fld48,   .iov_len = 48  },
+		{ .iov_base = (void *)body128, .iov_len = 128 }
+	};
+	int idx = 0;
+	while (idx < 3) {
+		struct msghdr msg = {
+			.msg_iov = &iov[idx],
+			.msg_iovlen = (size_t)(3 - idx)
+		};
+		ssize_t w = sendmsg(fd, &msg, MSG_NOSIGNAL);
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				sched_yield();
+				continue;
+			}
+			return -1;
+		}
+		if (w == 0)
+			return -1;
+		size_t rem = (size_t)w;
+		while (idx < 3 && rem >= iov[idx].iov_len) {
+			rem -= iov[idx].iov_len;
+			idx++;
+		}
+		if (idx < 3 && rem > 0) {
+			iov[idx].iov_base = (char *)iov[idx].iov_base + rem;
+			iov[idx].iov_len -= rem;
+		}
+	}
+	return 0;
+}
+
+static int recv_exact_192(int fd, uint8_t *buf)
+{
+	size_t got = 0;
+	while (got < 192) {
+		ssize_t r = recv(fd, buf + got, 192 - got, 0);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (r == 0)
+			return -1;
+		got += (size_t)r;
+	}
+	return 0;
+}
+
+struct dbus_ep_ctx {
+	int fd;
+	int rpcs;
+	pthread_barrier_t *bar;
+};
+
+static void *dbus_client_thread(void *arg)
+{
+	struct dbus_ep_ctx *c = (struct dbus_ep_ctx *)arg;
+	uint8_t hdr[16], fld[48], body[128], reply[192];
+	memset(hdr, 0x6C, sizeof(hdr));
+	memset(fld, 0x42, sizeof(fld));
+	memset(body, 0x24, sizeof(body));
+	pthread_barrier_wait(c->bar);
+
+	for (int i = 0; i < c->rpcs; i++) {
+		if (send_dbus_3iov(c->fd, hdr, fld, body) != 0)
+			return NULL;
+		if (recv_exact_192(c->fd, reply) != 0)
+			return NULL;
+	}
+	return NULL;
+}
+
+static void *dbus_service_thread(void *arg)
+{
+	struct dbus_ep_ctx *c = (struct dbus_ep_ctx *)arg;
+	uint8_t req[192];
+	pthread_barrier_wait(c->bar);
+
+	for (int i = 0; i < c->rpcs; i++) {
+		if (recv_exact_192(c->fd, req) != 0)
+			return NULL;
+		if (send_dbus_3iov(c->fd, req, req + 16, req + 64) != 0)
+			return NULL;
 	}
 	return NULL;
 }
@@ -722,6 +1526,175 @@ static void run_suite3_unix_ipc(int trials)
 	}
 	close(dummy_pipe[0]);
 	close(dummy_pipe[1]);
+
+	// 3F: Wayland/PipeWire/D-Bus 1-memfd SCM_RIGHTS send+recv+close RTT (100,000 pairs/trial)
+	{
+		int sv[2];
+		socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
+		int mfd = memfd_create("netzero_scm_bench", MFD_CLOEXEC);
+		char init_mfd[64] = {0};
+		ssize_t mw = write(mfd, init_mfd, sizeof(init_mfd));
+		(void)mw;
+		pin_cpu(0);
+
+		char tx_pl[32] = "wl_shm_create_pool_frame_sync01";
+		char rx_pl[32];
+		union {
+			char buf[CMSG_SPACE(sizeof(int))];
+			struct cmsghdr align;
+		} tx_c, rx_c;
+		memset(&tx_c, 0, sizeof(tx_c));
+
+		struct iovec tx_iov = { .iov_base = tx_pl, .iov_len = sizeof(tx_pl) };
+		struct msghdr tx_msg = {
+			.msg_iov = &tx_iov, .msg_iovlen = 1,
+			.msg_control = tx_c.buf, .msg_controllen = sizeof(tx_c.buf)
+		};
+		struct cmsghdr *cm = CMSG_FIRSTHDR(&tx_msg);
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type = SCM_RIGHTS;
+		cm->cmsg_len = CMSG_LEN(sizeof(int));
+		memcpy(CMSG_DATA(cm), &mfd, sizeof(int));
+
+		const int N_SCM = 100000;
+		for (int i = 0; i < 2000; i++) {
+			if (sendmsg(sv[0], &tx_msg, 0) > 0) {
+				struct iovec rx_iov = { .iov_base = rx_pl, .iov_len = sizeof(rx_pl) };
+				struct msghdr rx_msg = {
+					.msg_iov = &rx_iov, .msg_iovlen = 1,
+					.msg_control = rx_c.buf, .msg_controllen = sizeof(rx_c.buf)
+				};
+				if (recvmsg(sv[1], &rx_msg, MSG_CMSG_CLOEXEC) > 0) {
+					for (struct cmsghdr *rc = CMSG_FIRSTHDR(&rx_msg); rc; rc = CMSG_NXTHDR(&rx_msg, rc)) {
+						if (rc->cmsg_level == SOL_SOCKET && rc->cmsg_type == SCM_RIGHTS) {
+							int rfd;
+							memcpy(&rfd, CMSG_DATA(rc), sizeof(int));
+							close(rfd);
+						}
+					}
+				}
+			}
+		}
+
+		for (int t = 0; t < trials; t++) {
+			uint64_t t0 = nsec_now();
+			for (int i = 0; i < N_SCM; i++) {
+				if (sendmsg(sv[0], &tx_msg, 0) > 0) {
+					struct iovec rx_iov = { .iov_base = rx_pl, .iov_len = sizeof(rx_pl) };
+					struct msghdr rx_msg = {
+						.msg_iov = &rx_iov, .msg_iovlen = 1,
+						.msg_control = rx_c.buf, .msg_controllen = sizeof(rx_c.buf)
+					};
+					if (recvmsg(sv[1], &rx_msg, MSG_CMSG_CLOEXEC) > 0) {
+						for (struct cmsghdr *rc = CMSG_FIRSTHDR(&rx_msg); rc; rc = CMSG_NXTHDR(&rx_msg, rc)) {
+							if (rc->cmsg_level == SOL_SOCKET && rc->cmsg_type == SCM_RIGHTS) {
+								int rfd;
+								memcpy(&rfd, CMSG_DATA(rc), sizeof(int));
+								close(rfd);
+							}
+						}
+					}
+				}
+			}
+			uint64_t t1 = nsec_now();
+			emit_sample("S3_AF_UNIX", "scm_rights_memfd_pair_ns", t,
+				    (double)(t1 - t0) / N_SCM, "ns/pair", "lower");
+		}
+		close(mfd);
+		close(sv[0]);
+		close(sv[1]);
+	}
+
+	// 3G: Realistic dbus-broker 2-hop simulation (4 clients + 1 epoll broker + 4 services, 3-iovec 16+48+128B)
+	{
+		const int N_DBUS = 4;
+		const int RPCS_PER_CLI = 15000;
+		const int TARGET_RPCS = N_DBUS * RPCS_PER_CLI;
+
+		for (int t = 0; t < trials; t++) {
+			int ep = epoll_create1(EPOLL_CLOEXEC);
+			int cli_sv[4][2], svc_sv[4][2];
+			pthread_t cli_th[4], svc_th[4];
+			struct dbus_ep_ctx cctx[4], sctx[4];
+			pthread_barrier_t bar;
+			pthread_barrier_init(&bar, NULL, 2 * N_DBUS + 1);
+
+			for (int i = 0; i < N_DBUS; i++) {
+				socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, cli_sv[i]);
+				socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, svc_sv[i]);
+				fcntl(cli_sv[i][0], F_SETFL, O_NONBLOCK);
+				fcntl(svc_sv[i][0], F_SETFL, O_NONBLOCK);
+
+				struct epoll_event cev = { .events = EPOLLIN, .data.u32 = (uint32_t)i };
+				struct epoll_event sev = { .events = EPOLLIN, .data.u32 = (uint32_t)(N_DBUS + i) };
+				epoll_ctl(ep, EPOLL_CTL_ADD, cli_sv[i][0], &cev);
+				epoll_ctl(ep, EPOLL_CTL_ADD, svc_sv[i][0], &sev);
+
+				cctx[i] = (struct dbus_ep_ctx){ .fd = cli_sv[i][1], .rpcs = RPCS_PER_CLI, .bar = &bar };
+				sctx[i] = (struct dbus_ep_ctx){ .fd = svc_sv[i][1], .rpcs = RPCS_PER_CLI, .bar = &bar };
+				pthread_create(&cli_th[i], NULL, dbus_client_thread, &cctx[i]);
+				pthread_create(&svc_th[i], NULL, dbus_service_thread, &sctx[i]);
+			}
+
+			pin_cpu(0);
+			uint8_t ep_buf[8][512];
+			size_t ep_len[8] = {0};
+			int completed = 0;
+
+			pthread_barrier_wait(&bar);
+			uint64_t t0 = nsec_now();
+
+			struct epoll_event evs[16];
+			while (completed < TARGET_RPCS) {
+				int n = epoll_wait(ep, evs, 16, -1);
+				for (int e = 0; e < n; e++) {
+					uint32_t tag = evs[e].data.u32;
+					int is_svc = (tag >= (uint32_t)N_DBUS);
+					int idx = is_svc ? (int)(tag - (uint32_t)N_DBUS) : (int)tag;
+					int rfd = is_svc ? svc_sv[idx][0] : cli_sv[idx][0];
+					int dst_fd = is_svc ? cli_sv[idx][0] : svc_sv[idx][0];
+
+					for (;;) {
+						ssize_t r = recv(rfd, ep_buf[tag] + ep_len[tag],
+								 sizeof(ep_buf[tag]) - ep_len[tag], MSG_DONTWAIT);
+						if (r <= 0)
+							break;
+						ep_len[tag] += (size_t)r;
+						size_t consumed = 0;
+						while (ep_len[tag] - consumed >= 192) {
+							uint8_t *m = ep_buf[tag] + consumed;
+							send_dbus_3iov(dst_fd, m, m + 16, m + 64);
+							consumed += 192;
+							if (is_svc)
+								completed++;
+						}
+						if (consumed > 0) {
+							size_t left = ep_len[tag] - consumed;
+							if (left > 0)
+								memmove(ep_buf[tag], ep_buf[tag] + consumed, left);
+							ep_len[tag] = left;
+						}
+					}
+				}
+			}
+
+			for (int i = 0; i < N_DBUS; i++) {
+				pthread_join(cli_th[i], NULL);
+				pthread_join(svc_th[i], NULL);
+			}
+			uint64_t t1 = nsec_now();
+
+			pthread_barrier_destroy(&bar);
+			close(ep);
+			for (int i = 0; i < N_DBUS; i++) {
+				close(cli_sv[i][0]); close(cli_sv[i][1]);
+				close(svc_sv[i][0]); close(svc_sv[i][1]);
+			}
+
+			double krps = ((double)TARGET_RPCS / 1000.0) / ((double)(t1 - t0) / 1e9);
+			emit_sample("S3_AF_UNIX", "dbus_broker_sim_2hop_krps", t, krps, "kRPS", "higher");
+		}
+	}
 }
 
 // ============================================================================
@@ -1323,10 +2296,16 @@ int main(int argc, char **argv)
 	}
 
 	int trials = 10;
-	if (argc >= 2)
+	if (argc >= 3 && strcmp(argv[1], "--trial") == 0) {
+		g_trial_offset = atoi(argv[2]);
+		if (g_trial_offset < 0)
+			g_trial_offset = 0;
+		trials = 1;
+	} else if (argc >= 2) {
 		trials = atoi(argv[1]);
-	if (trials < 1)
-		trials = 10;
+		if (trials < 1)
+			trials = 10;
+	}
 
 	pthread_t mt_holder;
 	pthread_create(&mt_holder, NULL, mt_holder_fn, NULL);

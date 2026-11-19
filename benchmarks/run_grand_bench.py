@@ -27,8 +27,8 @@ import tempfile
 import time
 from pathlib import Path
 
-BENCH_DIR = Path(__file__).resolve().parent
-ENGINE_DIR = Path(os.environ.get("ENGINE_V2_DIR", str(Path.home() / "projects" / "engine-v2")))
+BENCH_DIR = Path("/home/arch-cetin/.gemini/antigravity/scratch/socket-overhaul/grand_bench")
+ENGINE_DIR = Path("/home/arch-cetin/projects/engine-v2")
 
 
 def sh_out(cmd: str, timeout: float = 30.0) -> str:
@@ -133,24 +133,23 @@ class Collector:
 
 
 def ensure_binaries():
-    march = os.environ.get("ARCH_MARCH", "native")
-    cc = os.environ.get("CC", "clang")
+    c_src = BENCH_DIR / "grand_socket_bench.c"
     c_bin = BENCH_DIR / "grand_socket_bench"
+    w_src = BENCH_DIR / "live_wayland_ping.c"
     w_bin = BENCH_DIR / "live_wayland_ping"
-    if not c_bin.exists():
+    if not c_bin.exists() or (c_src.exists() and c_src.stat().st_mtime > c_bin.stat().st_mtime):
         subprocess.run(
-            [cc, "-Wall", "-Wextra", "-O3", f"-march={march}", "-pthread",
-             str(BENCH_DIR / "grand_socket_bench.c"), "-o", str(c_bin)],
+            ["clang", "-Wall", "-Wextra", "-O3", "-march=tigerlake", "-pthread",
+             str(c_src), "-o", str(c_bin)],
             check=True,
         )
-    if not w_bin.exists():
+    if not w_bin.exists() or (w_src.exists() and w_src.stat().st_mtime > w_bin.stat().st_mtime):
         wl_flags = sh_out("pkg-config --cflags --libs wayland-client").split()
-        if wl_flags:
-            subprocess.run(
-                [cc, "-Wall", "-Wextra", "-O3", f"-march={march}",
-                 str(BENCH_DIR / "live_wayland_ping.c"), *wl_flags, "-o", str(w_bin)],
-                check=True,
-            )
+        subprocess.run(
+            ["clang", "-Wall", "-Wextra", "-O3", "-march=tigerlake",
+             str(w_src), *wl_flags, "-o", str(w_bin)],
+            check=True,
+        )
 
 
 def parse_ping_rtts(output: str) -> list[float]:
@@ -181,9 +180,6 @@ def run_engine_v2_bench(col: Collector, trials: int, under_storm: bool):
     env.setdefault("WAYLAND_DISPLAY", "wayland-0")
 
     engine_bin = ENGINE_DIR / "build/release/bin/engine"
-    if not engine_bin.exists():
-        print(f"  [SKIP] Optional {engine_bin} not present on this host.", flush=True)
-        return
     storm_proc = None
     if under_storm:
         storm_proc = subprocess.Popen(
@@ -239,20 +235,18 @@ def run_engine_v2_bench(col: Collector, trials: int, under_storm: bool):
 
 
 def run_suite6_wayland(col: Collector, trials: int):
+    print(f"[Suite 6] Running Live GNOME/Mutter wl_display_roundtrip ({trials} trials x 2,000 RTs)...", flush=True)
     env = os.environ.copy()
     env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     env.setdefault("WAYLAND_DISPLAY", "wayland-0")
-    wl_bin = BENCH_DIR / "live_wayland_ping"
-    if wl_bin.exists():
-        print(f"[Suite 6] Running Live GNOME/Mutter wl_display_roundtrip ({trials} trials x 2,000 RTs)...", flush=True)
-        p = subprocess.run(
-            [str(wl_bin), str(trials), "2000"],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        col.ingest_jsonl(p.stdout)
+    p = subprocess.run(
+        [str(BENCH_DIR / "live_wayland_ping"), str(trials), "2000"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    col.ingest_jsonl(p.stdout)
 
     # Engine-v2 unit wire & io_uring dispatch tests (10 trials each)
     for test_bin, mprefix in [
@@ -533,6 +527,23 @@ def compare_runs(netzero_path: Path, stock_path: Path) -> str:
             f"| `{mn['suite']}` | `{mn['metric']}` | {s_mean:.2f} ± {s_sd:.2f} "
             f"| **{n_mean:.2f}** ± {n_sd:.2f} | {imp} | `{mn['unit']}` |"
         )
+
+    nz_only_keys = sorted(set(nz["metrics"].keys()) - set(st["metrics"].keys()))
+    if nz_only_keys:
+        lines += [
+            "",
+            "## 3. Additional Metrics (New in NetZero Run)",
+            "| Suite | Metric | Mean ± StdDev | Median (p50) | p99 | Unit |",
+            "| :--- | :--- | :---: | :---: | :---: | :---: |",
+        ]
+        for k in nz_only_keys:
+            mn = nz["metrics"][k]
+            st_n = mn["stats"]
+            lines.append(
+                f"| `{mn['suite']}` | `{mn['metric']}` | **{st_n['mean']:.2f}** ± {st_n['stdev']:.2f} "
+                f"| {st_n['median']:.2f} | {st_n['p99']:.2f} | `{mn['unit']}` |"
+            )
+
     lines.append("")
     return "\n".join(lines)
 

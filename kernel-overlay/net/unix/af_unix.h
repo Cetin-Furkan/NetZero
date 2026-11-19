@@ -3,6 +3,9 @@
 #define __AF_UNIX_H
 
 #include <linux/pid_types.h>
+#include <linux/preempt.h>
+#include <linux/processor.h>
+#include <linux/uaccess.h>
 #include <linux/uidgid.h>
 
 #define UNIX_HASH_MOD	(256 - 1)
@@ -24,6 +27,67 @@ struct unix_skb_parms {
 } __randomize_layout;
 
 bool unix_stream_ring_readable(const struct sock *sk);
+
+/*
+ * Two-level consumer serialization for SOCK_STREAM rx_ring:
+ *   u->io_fast == 0 : free
+ *   u->io_fast == 1 : held by in-atomic fastpath (<= 4 KiB, preempt & pagefault disabled)
+ *   u->io_fast == 2 : held by slowpath mutex owner (&u->iolock)
+ *
+ * Fastpath acquires via single cmpxchg_acquire(0 -> 1) and releases via plain
+ * store_release(0) with zero atomic RMW on unlock. Slowpath holds &u->iolock
+ * and drains any bounded <= 4 KiB in-atomic holder before setting 2.
+ */
+static inline bool unix_io_try_fast(struct unix_sock *u)
+{
+	int zero = 0;
+
+	preempt_disable();
+	pagefault_disable();
+	if (likely(atomic_try_cmpxchg_acquire(&u->io_fast, &zero, 1)))
+		return true;
+	pagefault_enable();
+	preempt_enable();
+	return false;
+}
+
+static inline void unix_io_unlock_fast(struct unix_sock *u)
+{
+	atomic_set_release(&u->io_fast, 0);
+	pagefault_enable();
+	preempt_enable();
+}
+
+static inline void unix_io_lock(struct unix_sock *u)
+{
+	mutex_lock(&u->iolock);
+	for (;;) {
+		int zero = 0;
+
+		if (likely(atomic_try_cmpxchg_acquire(&u->io_fast, &zero, 2)))
+			break;
+		cpu_relax();
+	}
+}
+
+static inline bool unix_io_trylock(struct unix_sock *u)
+{
+	int zero = 0;
+
+	if (!mutex_trylock(&u->iolock))
+		return false;
+	if (!atomic_try_cmpxchg_acquire(&u->io_fast, &zero, 2)) {
+		mutex_unlock(&u->iolock);
+		return false;
+	}
+	return true;
+}
+
+static inline void unix_io_unlock(struct unix_sock *u)
+{
+	atomic_set_release(&u->io_fast, 0);
+	mutex_unlock(&u->iolock);
+}
 
 #define UNIXCB(skb)	(*(struct unix_skb_parms *)&((skb)->cb))
 

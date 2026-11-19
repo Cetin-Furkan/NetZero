@@ -87,6 +87,7 @@
 #include <linux/fs.h>
 #include <linux/fs_struct.h>
 #include <linux/init.h>
+#include <linux/io_uring.h>
 #include <linux/kernel.h>
 #include <linux/mount.h>
 #include <linux/namei.h>
@@ -122,25 +123,382 @@ static spinlock_t bsd_socket_locks[UNIX_HASH_SIZE / 2];
 #define UNIX_RING_MID_ORDER	4	/* 64 KiB fallback bulk tier */
 #define UNIX_RING_MAX_ORDER	6	/* 256 KiB adaptive bulk tier (4x 64KB) */
 #define UNIX_RING_BULK_THRESH	8192UL
+#define UNIX_RING_ATOMIC_MAX	4096UL
+
+#define UNIX_RING_FD_SLOTS	8
+#define UNIX_RING_FD_MASK	(UNIX_RING_FD_SLOTS - 1)
+#define UNIX_RING_FD_MAX	4
+
+struct unix_ring_fd_slot {
+	u64		ring_seq;
+	u32		msg_len;
+	u8		count;
+	u8		pad[3];
+	struct file	*fp[UNIX_RING_FD_MAX];
+};
+
+/*
+ * Lazily allocated on first inline SCM_RIGHTS send so non-FD sockets stay in
+ * kmalloc-256 (~192 B) and skip all fd_head/fd_tail cacheline traffic.
+ */
+struct unix_ring_fd_ring {
+	/* Producer-private cache line */
+	u64		fd_head ____cacheline_aligned_in_smp;
+
+	/* Consumer-private cache line */
+	u64		fd_tail ____cacheline_aligned_in_smp;
+
+	/* Inline 4-FD SCM_RIGHTS sideband slots (non-AF_UNIX, non-io_uring fds) */
+	struct unix_ring_fd_slot slots[UNIX_RING_FD_SLOTS] ____cacheline_aligned_in_smp;
+};
 
 struct unix_ring {
 	u8		*buf;
 	struct page	*pages;
+	struct unix_ring_fd_ring *fd_ring;
 	u32		size;
 	u32		mask;
 	u16		order;
 	u8		prod_throttled;
+	u64		drain_until_seq;
 
 	/* Producer-private cache line */
-	struct mutex	prod_lock ____cacheline_aligned_in_smp;
+	atomic_t	prod_fast ____cacheline_aligned_in_smp;
 	u64		head;
 	u64		cached_tail;
+	struct mutex	prod_lock;
 
 	/* Consumer-private cache line */
 	u64		tail ____cacheline_aligned_in_smp;
 	u64		cached_head;
 	unsigned long	last_rx_jiffies;
 };
+
+/*
+ * Two-level producer serialization for unix_ring:
+ *   ring->prod_fast == 0 : free
+ *   ring->prod_fast == 1 : held by in-atomic fastpath (<= 4 KiB, preempt & pagefault disabled)
+ *   ring->prod_fast == 2 : held by slowpath mutex owner (&ring->prod_lock)
+ */
+static inline bool unix_ring_prod_try_fast(struct unix_ring *ring)
+{
+	int zero = 0;
+
+	preempt_disable();
+	pagefault_disable();
+	if (likely(atomic_try_cmpxchg_acquire(&ring->prod_fast, &zero, 1)))
+		return true;
+	pagefault_enable();
+	preempt_enable();
+	return false;
+}
+
+static inline void unix_ring_prod_unlock_fast(struct unix_ring *ring)
+{
+	atomic_set_release(&ring->prod_fast, 0);
+	pagefault_enable();
+	preempt_enable();
+}
+
+static inline void unix_ring_prod_lock(struct unix_ring *ring)
+{
+	mutex_lock(&ring->prod_lock);
+	for (;;) {
+		int zero = 0;
+
+		if (likely(atomic_try_cmpxchg_acquire(&ring->prod_fast, &zero, 2)))
+			break;
+		cpu_relax();
+	}
+}
+
+static inline void unix_ring_prod_unlock(struct unix_ring *ring)
+{
+	atomic_set_release(&ring->prod_fast, 0);
+	mutex_unlock(&ring->prod_lock);
+}
+
+/*
+ * Caller MUST have validated access_ok() on the user range AND have
+ * pagefault_disable() active; dst/src ring offsets are bounded within ring->size.
+ */
+static __always_inline unsigned long
+unix_ring_copy_from_user_inatomic(void *dst, const void __user *src,
+				  unsigned long n)
+{
+	unsigned long res;
+
+	if (can_do_masked_user_access())
+		src = mask_user_address(src);
+	else
+		barrier_nospec();
+	instrument_copy_from_user_before(dst, src, n);
+	res = raw_copy_from_user(dst, src, n);
+	instrument_copy_from_user_after(dst, src, n, res);
+	return res;
+}
+
+static __always_inline unsigned long
+unix_ring_copy_to_user_inatomic(void __user *dst, const void *src,
+				unsigned long n)
+{
+	instrument_copy_to_user(dst, src, n);
+	return raw_copy_to_user(dst, src, n);
+}
+
+#if defined(CONFIG_X86_64) && !defined(CONFIG_KASAN) && !defined(CONFIG_KMSAN)
+static __always_inline unsigned long
+unix_ring_copy_user_smap(void *to, const void *from, unsigned long len)
+{
+	asm volatile(
+		"1:\n\t"
+		ALTERNATIVE("rep movsb",
+			    "call rep_movs_alternative", ALT_NOT(X86_FEATURE_FSRM))
+		"2:\n"
+		_ASM_EXTABLE_UA(1b, 2b)
+		: "+c" (len), "+D" (to), "+S" (from), ASM_CALL_CONSTRAINT
+		: : "memory", "rax");
+	return len;
+}
+#endif
+
+static inline void unix_ring_fput_array(struct file **fp, int count)
+{
+	while (count > 0)
+		fput(fp[--count]);
+}
+
+static inline void unix_ring_raise_drain_seq(struct unix_ring *ring, u64 target)
+{
+	u64 cur = READ_ONCE(ring->drain_until_seq);
+
+	while (target > cur) {
+		if (try_cmpxchg64(&ring->drain_until_seq, &cur, target))
+			break;
+	}
+}
+
+static struct unix_ring_fd_ring *
+unix_ring_get_or_alloc_fdr(struct unix_ring *ring)
+{
+	struct unix_ring_fd_ring *fdr = smp_load_acquire(&ring->fd_ring);
+	struct unix_ring_fd_ring *new_fdr;
+
+	if (likely(fdr))
+		return fdr;
+
+	new_fdr = kzalloc(sizeof(*new_fdr), GFP_KERNEL_ACCOUNT);
+	if (!new_fdr)
+		return NULL;
+
+	unix_ring_prod_lock(ring);
+	if (unlikely(!ring->buf)) {
+		unix_ring_prod_unlock(ring);
+		kfree(new_fdr);
+		return NULL;
+	}
+	fdr = ring->fd_ring;
+	if (likely(!fdr)) {
+		smp_store_release(&ring->fd_ring, new_fdr);
+		fdr = new_fdr;
+		new_fdr = NULL;
+	}
+	unix_ring_prod_unlock(ring);
+
+	kfree(new_fdr);
+	return fdr;
+}
+
+static int unix_ring_drain_fds_locked(struct unix_sock *u,
+				      struct unix_ring *ring,
+				      struct file **out_fp)
+{
+	struct unix_ring_fd_ring *fdr = ring->fd_ring;
+	u64 fd_tail, fd_head;
+	int dropped = 0;
+
+	if (!fdr)
+		return 0;
+
+	fd_tail = READ_ONCE(fdr->fd_tail);
+	fd_head = fdr->fd_head;
+	while (fd_tail != fd_head) {
+		struct unix_ring_fd_slot *slot =
+			&fdr->slots[fd_tail & UNIX_RING_FD_MASK];
+		int i;
+
+		for (i = 0; i < slot->count; i++) {
+			if (slot->fp[i]) {
+				out_fp[dropped++] = slot->fp[i];
+				slot->fp[i] = NULL;
+			}
+		}
+		slot->count = 0;
+		fd_tail++;
+	}
+	WRITE_ONCE(fdr->fd_tail, fd_head);
+	if (dropped)
+		atomic_sub(dropped, &u->scm_stat.nr_fds);
+	return dropped;
+}
+
+static bool unix_ring_extract_inline_fds(struct msghdr *msg,
+					 struct file *fp[UNIX_RING_FD_MAX],
+					 int *out_count)
+{
+	struct cmsghdr *cmsg;
+	int count = 0;
+
+	for_each_cmsghdr(cmsg, msg) {
+		int *fdp, num, i;
+
+		if (unlikely(!CMSG_OK(msg, cmsg)))
+			goto fail;
+		if (unlikely(cmsg->cmsg_level != SOL_SOCKET ||
+			     cmsg->cmsg_type != SCM_RIGHTS))
+			goto fail;
+
+		num = (cmsg->cmsg_len - sizeof(struct cmsghdr)) / sizeof(int);
+		if (unlikely(num <= 0))
+			continue;
+		if (unlikely(count + num > UNIX_RING_FD_MAX))
+			goto fail;
+
+		fdp = (int *)CMSG_DATA(cmsg);
+		for (i = 0; i < num; i++) {
+			int fd = fdp[i];
+			struct file *file;
+
+			if (unlikely(fd < 0))
+				goto fail;
+			file = fget_raw(fd);
+			if (unlikely(!file))
+				goto fail;
+			/*
+			 * Critical GC Safety Invariant: NEVER place AF_UNIX
+			 * sockets or io_uring fds on the inline sideband ring.
+			 * Fall back to stock scm_send() + unix_gc graph.
+			 */
+			if (unlikely(io_is_uring_fops(file) ||
+				     unix_get_socket(file))) {
+				fput(file);
+				goto fail;
+			}
+			fp[count++] = file;
+		}
+	}
+
+	if (unlikely(!count))
+		return false;
+
+	*out_count = count;
+	return true;
+
+fail:
+	unix_ring_fput_array(fp, count);
+	return false;
+}
+
+static void unix_ring_deliver_fds(struct sock *sk, struct msghdr *msg,
+				  struct file **fp, int count)
+{
+	unsigned int o_flags;
+	bool notrunc;
+	int fdmax, i, err = 0;
+
+	if (unlikely(!msg)) {
+		unix_ring_fput_array(fp, count);
+		return;
+	}
+
+	if (unlikely(!msg->msg_control)) {
+		msg->msg_flags |= MSG_CTRUNC;
+		unix_ring_fput_array(fp, count);
+		return;
+	}
+
+	if (WARN_ON_ONCE(!msg->msg_control_is_user)) {
+		unix_ring_fput_array(fp, count);
+		return;
+	}
+
+	o_flags = (msg->msg_flags & MSG_CMSG_CLOEXEC) ? O_CLOEXEC : 0;
+	notrunc = READ_ONCE(unix_sk(sk)->scm_rights_notrunc);
+
+#ifdef CONFIG_COMPAT
+	if (unlikely(msg->msg_flags & MSG_CMSG_COMPAT)) {
+		struct compat_cmsghdr __user *cm =
+			(struct compat_cmsghdr __user *)msg->msg_control_user;
+		int max_fds = msg->msg_controllen <= sizeof(struct compat_cmsghdr) ? 0 :
+			(int)((msg->msg_controllen - sizeof(struct compat_cmsghdr)) /
+			      sizeof(int));
+		int __user *cmsg_data =
+			(int __user *)((char __user *)cm + sizeof(struct compat_cmsghdr));
+
+		fdmax = min_t(int, max_fds, count);
+		for (i = 0; i < fdmax; i++) {
+			err = scm_recv_one_fd(fp[i], cmsg_data + i, o_flags, notrunc);
+			if (err < 0)
+				break;
+		}
+		if (i > 0) {
+			int cmlen = sizeof(struct compat_cmsghdr) + i * sizeof(int);
+
+			err = put_user(SOL_SOCKET, &cm->cmsg_level);
+			if (!err)
+				err = put_user(SCM_RIGHTS, &cm->cmsg_type);
+			if (!err)
+				err = put_user(cmlen, &cm->cmsg_len);
+			if (!err) {
+				if (msg->msg_controllen < cmlen)
+					cmlen = msg->msg_controllen;
+				msg->msg_control_user += cmlen;
+				msg->msg_controllen -= cmlen;
+			}
+		}
+		if (i < count || (count && fdmax <= 0))
+			msg->msg_flags |= MSG_CTRUNC;
+		unix_ring_fput_array(fp, count);
+		return;
+	}
+#endif
+
+	{
+		struct cmsghdr __user *cm =
+			(__force struct cmsghdr __user *)msg->msg_control_user;
+		int max_fds = msg->msg_controllen <= sizeof(struct cmsghdr) ? 0 :
+			(int)((msg->msg_controllen - sizeof(struct cmsghdr)) /
+			      sizeof(int));
+		int __user *cmsg_data = CMSG_USER_DATA(cm);
+
+		fdmax = min_t(int, max_fds, count);
+		for (i = 0; i < fdmax; i++) {
+			err = scm_recv_one_fd(fp[i], cmsg_data + i, o_flags, notrunc);
+			if (err < 0)
+				break;
+		}
+
+		if (i > 0) {
+			int cmlen = CMSG_LEN(i * sizeof(int));
+
+			scoped_user_write_access_size(cm, sizeof(*cm), efault) {
+				unsafe_put_user(SOL_SOCKET, &cm->cmsg_level, efault);
+				unsafe_put_user(SCM_RIGHTS, &cm->cmsg_type, efault);
+				unsafe_put_user(cmlen, &cm->cmsg_len, efault);
+			}
+			cmlen = CMSG_SPACE(i * sizeof(int));
+			if (msg->msg_controllen < cmlen)
+				cmlen = msg->msg_controllen;
+			msg->msg_control_user += cmlen;
+			msg->msg_controllen -= cmlen;
+		}
+	}
+efault:
+	if (i < count || (count && fdmax <= 0))
+		msg->msg_flags |= MSG_CTRUNC;
+
+	unix_ring_fput_array(fp, count);
+}
 
 static inline void unix_notify_readable(struct sock *other)
 {
@@ -711,9 +1069,27 @@ static void unix_sock_destructor(struct sock *sk)
 		unix_release_addr(u->addr);
 
 	if (sk->sk_type == SOCK_STREAM && u->rx_ring) {
-		if (u->rx_ring->pages)
-			__free_pages(u->rx_ring->pages, u->rx_ring->order);
-		kfree(u->rx_ring);
+		struct unix_ring *ring = u->rx_ring;
+		struct unix_ring_fd_ring *fdr = ring->fd_ring;
+
+		if (fdr) {
+			while (fdr->fd_tail != fdr->fd_head) {
+				struct unix_ring_fd_slot *slot =
+					&fdr->slots[fdr->fd_tail & UNIX_RING_FD_MASK];
+				int i;
+
+				for (i = 0; i < slot->count; i++) {
+					if (slot->fp[i])
+						fput(slot->fp[i]);
+				}
+				fdr->fd_tail++;
+			}
+			kfree(fdr);
+			ring->fd_ring = NULL;
+		}
+		if (ring->pages)
+			__free_pages(ring->pages, ring->order);
+		kfree(ring);
 		u->rx_ring = NULL;
 	}
 
@@ -792,14 +1168,21 @@ static void unix_release_sock(struct sock *sk, int embrion)
 		struct unix_ring *ring = smp_load_acquire(&u->rx_ring);
 
 		if (ring) {
-			mutex_lock(&ring->prod_lock);
+			struct file *to_put[UNIX_RING_FD_SLOTS * UNIX_RING_FD_MAX];
+			int dropped;
+
+			unix_ring_prod_lock(ring);
 			if (ring->pages) {
 				__free_pages(ring->pages, ring->order);
 				ring->pages = NULL;
-				ring->buf = NULL;
+				WRITE_ONCE(ring->buf, NULL);
 				WRITE_ONCE(ring->tail, ring->head);
 			}
-			mutex_unlock(&ring->prod_lock);
+			dropped = unix_ring_drain_fds_locked(u, ring, to_put);
+			unix_ring_prod_unlock(ring);
+
+			if (unlikely(dropped))
+				unix_ring_fput_array(to_put, dropped);
 		}
 	}
 
@@ -1217,6 +1600,7 @@ static struct sock *unix_create1(struct net *net, struct socket *sock, int kern,
 	spin_lock_init(&u->lock);
 	lock_set_cmp_fn(&u->lock, unix_state_lock_cmp_fn, NULL);
 	mutex_init(&u->iolock); /* single task reading lock */
+	atomic_set(&u->io_fast, 0);
 	mutex_init(&u->bindlock); /* single task binding lock */
 	init_waitqueue_head(&u->peer_wait);
 	if (type == SOCK_STREAM) {
@@ -2452,7 +2836,7 @@ static int queue_oob(struct sock *sk, struct msghdr *msg, struct sock *other,
 
 	ring = smp_load_acquire(&ousk->rx_ring);
 	if (ring)
-		mutex_lock(&ring->prod_lock);
+		unix_ring_prod_lock(ring);
 
 	unix_state_lock(other);
 
@@ -2481,14 +2865,14 @@ static int queue_oob(struct sock *sk, struct msghdr *msg, struct sock *other,
 	sk_send_sigurg(other);
 	unix_state_unlock(other);
 	if (ring)
-		mutex_unlock(&ring->prod_lock);
+		unix_ring_prod_unlock(ring);
 	unix_notify_readable(other);
 
 	return 0;
 out_unlock:
 	unix_state_unlock(other);
 	if (ring)
-		mutex_unlock(&ring->prod_lock);
+		unix_ring_prod_unlock(ring);
 out:
 	consume_skb(skb);
 	return err;
@@ -2535,21 +2919,22 @@ static void unix_ring_try_expand(struct sock *other, struct unix_ring *ring)
 	new_size = PAGE_SIZE << new_order;
 	new_mask = new_size - 1;
 
-	mutex_lock(&ring->prod_lock);
+	unix_ring_prod_lock(ring);
 	if (unlikely(!ring->buf || ring->order >= new_order ||
 		     sock_flag(other, SOCK_DEAD) ||
 		     (READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN))) {
-		mutex_unlock(&ring->prod_lock);
+		unix_ring_prod_unlock(ring);
 		__free_pages(new_pages, new_order);
 		return;
 	}
 
 	/*
-	 * Acquire consumer iolock via non-blocking trylock to guarantee zero
-	 * concurrent readers during live buffer swap with zero deadlock risk.
+	 * Acquire consumer iolock + io_fast via non-blocking trylock to
+	 * guarantee zero concurrent readers (fast or slow) during live buffer
+	 * swap with zero deadlock risk.
 	 */
-	if (!mutex_trylock(&otheru->iolock)) {
-		mutex_unlock(&ring->prod_lock);
+	if (!unix_io_trylock(otheru)) {
+		unix_ring_prod_unlock(ring);
 		__free_pages(new_pages, new_order);
 		return;
 	}
@@ -2582,8 +2967,8 @@ static void unix_ring_try_expand(struct sock *other, struct unix_ring *ring)
 		ring->cached_tail = tail;
 	}
 
-	mutex_unlock(&otheru->iolock);
-	mutex_unlock(&ring->prod_lock);
+	unix_io_unlock(otheru);
+	unix_ring_prod_unlock(ring);
 
 	if (old_pages)
 		__free_pages(old_pages, old_order);
@@ -2630,6 +3015,7 @@ static struct unix_ring *unix_ring_get_or_alloc(struct sock *other,
 	ring->order = order;
 	ring->size = PAGE_SIZE << order;
 	ring->mask = ring->size - 1;
+	atomic_set(&ring->prod_fast, 0);
 	mutex_init(&ring->prod_lock);
 
 	unix_state_lock(other);
@@ -2653,31 +3039,119 @@ static struct unix_ring *unix_ring_get_or_alloc(struct sock *other,
 	return ring;
 }
 
-static ssize_t unix_ring_send_ubuf(struct sock *sk, struct sock *other,
-				   struct unix_ring *ring,
-				   const u8 __user *ubuf, size_t len,
-				   unsigned int flags)
+static inline bool unix_ring_iov_access_ok(const struct iovec *iov,
+					   unsigned long nr_segs,
+					   size_t total_len)
+{
+	size_t rem = total_len;
+	unsigned long seg;
+
+	for (seg = 0; seg < nr_segs && rem > 0; seg++) {
+		size_t slen = min_t(size_t, iov[seg].iov_len, rem);
+
+		if (slen && unlikely(!access_ok(iov[seg].iov_base, slen)))
+			return false;
+		rem -= slen;
+	}
+	return rem == 0;
+}
+
+static inline bool unix_ring_copy_iov_inatomic(struct unix_ring *ring,
+					       u64 head, u32 rsize, u32 rmask,
+					       const struct iovec *iov,
+					       unsigned long nr_segs,
+					       size_t total_len)
+{
+	u64 pos = head;
+	size_t rem = total_len;
+	unsigned long seg;
+#if defined(CONFIG_X86_64) && !defined(CONFIG_KASAN) && !defined(CONFIG_KMSAN)
+	u8 *rbuf = ring->buf;
+	bool ok = true;
+
+	if (!can_do_masked_user_access())
+		barrier_nospec();
+	stac();
+	for (seg = 0; seg < nr_segs && rem > 0; seg++) {
+		size_t slen = min_t(size_t, iov[seg].iov_len, rem);
+		const u8 __user *sbase = iov[seg].iov_base;
+		u32 off;
+		size_t first;
+
+		if (unlikely(!slen))
+			continue;
+		if (can_do_masked_user_access())
+			sbase = mask_user_address(sbase);
+		off = (u32)pos & rmask;
+		first = min_t(size_t, slen, rsize - off);
+		if (unlikely(unix_ring_copy_user_smap(rbuf + off,
+						      (__force const void *)sbase,
+						      first))) {
+			ok = false;
+			break;
+		}
+		if (unlikely(slen > first)) {
+			if (unlikely(unix_ring_copy_user_smap(rbuf,
+							      (__force const void *)(sbase + first),
+							      slen - first))) {
+				ok = false;
+				break;
+			}
+		}
+		pos += slen;
+		rem -= slen;
+	}
+	clac();
+	return ok && rem == 0;
+#else
+	for (seg = 0; seg < nr_segs && rem > 0; seg++) {
+		size_t slen = min_t(size_t, iov[seg].iov_len, rem);
+		const u8 __user *sbase = iov[seg].iov_base;
+		u32 off;
+		size_t first;
+
+		if (unlikely(!slen))
+			continue;
+		off = (u32)pos & rmask;
+		first = min_t(size_t, slen, rsize - off);
+		if (unlikely(unix_ring_copy_from_user_inatomic(ring->buf + off,
+							       sbase, first)))
+			return false;
+		if (unlikely(slen > first)) {
+			if (unlikely(unix_ring_copy_from_user_inatomic(ring->buf,
+								       sbase + first,
+								       slen - first)))
+				return false;
+		}
+		pos += slen;
+		rem -= slen;
+	}
+	return rem == 0;
+#endif
+}
+
+static noinline ssize_t unix_ring_send_ubuf_slow(struct sock *sk,
+						 struct sock *other,
+						 struct unix_ring *ring,
+						 const u8 __user *ubuf,
+						 size_t len, unsigned int flags)
 {
 	struct unix_sock *u = unix_sk(sk);
 	long timeo = -1;
 	size_t sent = 0;
 	int err;
 
-	err = sock_error(sk);
-	if (unlikely(err))
-		return err;
-
 	while (sent < len) {
 		u64 head, avail, space;
 		size_t chunk, first;
 		u32 off, rsize, rmask;
 
-		mutex_lock(&ring->prod_lock);
+		unix_ring_prod_lock(ring);
 		if (unlikely(sock_flag(other, SOCK_DEAD) ||
 			     (READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) ||
 			     (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) ||
 			     !ring->buf)) {
-			mutex_unlock(&ring->prod_lock);
+			unix_ring_prod_unlock(ring);
 			if (!sent && !(flags & MSG_NOSIGNAL))
 				send_sig(SIGPIPE, current, 0);
 			return sent ?: -EPIPE;
@@ -2693,15 +3167,17 @@ static ssize_t unix_ring_send_ubuf(struct sock *sk, struct sock *other,
 			if (avail >= rsize) {
 				DEFINE_WAIT(wait);
 
-				if (ring->order < UNIX_RING_MAX_ORDER &&
-				    len >= 4096) {
-					mutex_unlock(&ring->prod_lock);
+				if (ring->order < UNIX_RING_MAX_ORDER) {
+					unix_ring_prod_unlock(ring);
 					unix_ring_try_expand(other, ring);
 					if (READ_ONCE(ring->size) > rsize)
 						continue;
-					mutex_lock(&ring->prod_lock);
-					if (unlikely(!ring->buf)) {
-						mutex_unlock(&ring->prod_lock);
+					unix_ring_prod_lock(ring);
+					if (unlikely(!ring->buf ||
+						     sock_flag(other, SOCK_DEAD) ||
+						     (READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) ||
+						     (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN))) {
+						unix_ring_prod_unlock(ring);
 						continue;
 					}
 					rsize = ring->size;
@@ -2714,10 +3190,10 @@ static ssize_t unix_ring_send_ubuf(struct sock *sk, struct sock *other,
 				ring->cached_tail = smp_load_acquire(&ring->tail);
 				if (head - ring->cached_tail < rsize) {
 					WRITE_ONCE(u->tx_ring_full, false);
-					mutex_unlock(&ring->prod_lock);
+					unix_ring_prod_unlock(ring);
 					continue;
 				}
-				mutex_unlock(&ring->prod_lock);
+				unix_ring_prod_unlock(ring);
 
 				if (timeo < 0)
 					timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
@@ -2738,6 +3214,8 @@ static ssize_t unix_ring_send_ubuf(struct sock *sk, struct sock *other,
 				    !signal_pending(current))
 					timeo = schedule_timeout(timeo);
 				finish_wait(sk_sleep(sk), &wait);
+				if ((READ_ONCE(ring->head) - smp_load_acquire(&ring->tail)) < READ_ONCE(ring->size))
+					WRITE_ONCE(u->tx_ring_full, false);
 
 				err = sock_error(sk);
 				if (unlikely(err))
@@ -2763,7 +3241,7 @@ static ssize_t unix_ring_send_ubuf(struct sock *sk, struct sock *other,
 
 		nz_prefetchw_range(ring->buf + off, first);
 		if (unlikely(copy_from_user(ring->buf + off, ubuf + sent, first))) {
-			mutex_unlock(&ring->prod_lock);
+			unix_ring_prod_unlock(ring);
 			return sent ?: -EFAULT;
 		}
 		if (chunk > first) {
@@ -2773,21 +3251,86 @@ static ssize_t unix_ring_send_ubuf(struct sock *sk, struct sock *other,
 			if (unlikely(copy_from_user(ring->buf,
 						    ubuf + sent + first,
 						    second))) {
-				smp_store_release(&ring->head, head + first);
-				mutex_unlock(&ring->prod_lock);
-				unix_notify_readable(other);
-				sent += first;
-				return sent;
+				unix_ring_prod_unlock(ring);
+				return sent ?: -EFAULT;
 			}
 		}
 
+		if (unlikely(atomic_read(&unix_sk(other)->scm_stat.nr_fds) > 0))
+			unix_ring_raise_drain_seq(ring, head + chunk);
 		smp_store_release(&ring->head, head + chunk);
-		mutex_unlock(&ring->prod_lock);
+		unix_ring_prod_unlock(ring);
 
 		unix_notify_readable(other);
 		sent += chunk;
 	}
 	return sent;
+}
+
+static ssize_t unix_ring_send_ubuf(struct sock *sk, struct sock *other,
+				   struct unix_ring *ring,
+				   const u8 __user *ubuf, size_t len,
+				   unsigned int flags)
+{
+	struct unix_sock *u = unix_sk(sk);
+	int err;
+
+	err = sock_error(sk);
+	if (unlikely(err))
+		return err;
+
+	/*
+	 * Mutex-free in-atomic fastpath for small uncontended transfers (<= 4 KiB).
+	 * Any fault, contention, ring-full, or shutdown exits cleanly without
+	 * advancing ring->head and falls through to the sleeping mutex loop.
+	 */
+	if (likely(len <= UNIX_RING_ATOMIC_MAX && access_ok(ubuf, len)) &&
+	    likely(unix_ring_prod_try_fast(ring))) {
+		if (likely(!sock_flag(other, SOCK_DEAD) &&
+			   !(READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) &&
+			   !(READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) &&
+			   ring->buf)) {
+			u32 rsize = ring->size;
+			u32 rmask = ring->mask;
+			u64 head = ring->head;
+			u64 avail = head - ring->cached_tail;
+
+			if (unlikely(avail + len > rsize)) {
+				ring->cached_tail = smp_load_acquire(&ring->tail);
+				avail = head - ring->cached_tail;
+			}
+			if (likely(avail + len <= rsize)) {
+				u32 off = (u32)head & rmask;
+				size_t first = min_t(size_t, len, rsize - off);
+				bool ok;
+
+				nz_prefetchw_range(ring->buf + off, first);
+				ok = !unix_ring_copy_from_user_inatomic(ring->buf + off,
+									ubuf, first);
+				if (ok && unlikely(len > first)) {
+					size_t second = len - first;
+
+					nz_prefetchw_range(ring->buf, second);
+					ok = !unix_ring_copy_from_user_inatomic(ring->buf,
+										ubuf + first,
+										second);
+				}
+				if (likely(ok)) {
+					if (unlikely(READ_ONCE(u->tx_ring_full)))
+						WRITE_ONCE(u->tx_ring_full, false);
+					if (unlikely(atomic_read(&unix_sk(other)->scm_stat.nr_fds) > 0))
+						unix_ring_raise_drain_seq(ring, head + len);
+					smp_store_release(&ring->head, head + len);
+					unix_ring_prod_unlock_fast(ring);
+					unix_notify_readable(other);
+					return (ssize_t)len;
+				}
+			}
+		}
+		unix_ring_prod_unlock_fast(ring);
+	}
+
+	return unix_ring_send_ubuf_slow(sk, other, ring, ubuf, len, flags);
 }
 
 ssize_t unix_ring_direct_send(struct socket *sock, const void __user *ubuf,
@@ -2845,6 +3388,292 @@ ssize_t unix_ring_direct_send(struct socket *sock, const void __user *ubuf,
 }
 EXPORT_SYMBOL(unix_ring_direct_send);
 
+static noinline ssize_t unix_ring_direct_sendv_slow(struct sock *sk,
+						    struct sock *other,
+						    struct unix_ring *ring,
+						    const struct iovec *iov,
+						    unsigned long nr_segs,
+						    size_t total_len,
+						    unsigned int flags)
+{
+	struct unix_sock *u = unix_sk(sk);
+	unsigned long seg_idx = 0;
+	size_t seg_off = 0, sent = 0;
+	long timeo = -1;
+	int err;
+
+	while (sent < total_len && seg_idx < nr_segs) {
+		u64 head, avail, space, pos;
+		size_t chunk, batch = 0;
+		u32 rsize, rmask;
+		bool faulted = false;
+
+		unix_ring_prod_lock(ring);
+		if (unlikely(sock_flag(other, SOCK_DEAD) ||
+			     (READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) ||
+			     (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) ||
+			     !ring->buf)) {
+			unix_ring_prod_unlock(ring);
+			if (!sent && !(flags & MSG_NOSIGNAL))
+				send_sig(SIGPIPE, current, 0);
+			return sent ?: -EPIPE;
+		}
+
+		rsize = ring->size;
+		rmask = ring->mask;
+		head = ring->head;
+		avail = head - ring->cached_tail;
+		if (unlikely(avail >= rsize)) {
+			ring->cached_tail = smp_load_acquire(&ring->tail);
+			avail = head - ring->cached_tail;
+			if (avail >= rsize) {
+				DEFINE_WAIT(wait);
+
+				if (ring->order < UNIX_RING_MAX_ORDER) {
+					unix_ring_prod_unlock(ring);
+					unix_ring_try_expand(other, ring);
+					if (READ_ONCE(ring->size) > rsize)
+						continue;
+					unix_ring_prod_lock(ring);
+					if (unlikely(!ring->buf ||
+						     sock_flag(other, SOCK_DEAD) ||
+						     (READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) ||
+						     (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN))) {
+						unix_ring_prod_unlock(ring);
+						continue;
+					}
+					rsize = ring->size;
+					head = ring->head;
+				}
+
+				WRITE_ONCE(u->tx_ring_full, true);
+				WRITE_ONCE(ring->prod_throttled, 1);
+				smp_mb();
+				ring->cached_tail = smp_load_acquire(&ring->tail);
+				if (head - ring->cached_tail < rsize) {
+					WRITE_ONCE(u->tx_ring_full, false);
+					unix_ring_prod_unlock(ring);
+					continue;
+				}
+				unix_ring_prod_unlock(ring);
+
+				if (timeo < 0)
+					timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
+				if (!timeo)
+					return sent ?: -EAGAIN;
+				if (signal_pending(current))
+					return sent ?: sock_intr_errno(timeo);
+
+				prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+				WRITE_ONCE(u->tx_ring_full, true);
+				WRITE_ONCE(ring->prod_throttled, 1);
+				smp_mb();
+				if ((READ_ONCE(ring->head) - smp_load_acquire(&ring->tail)) >= READ_ONCE(ring->size) &&
+				    !sock_flag(other, SOCK_DEAD) &&
+				    !(READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) &&
+				    !(READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) &&
+				    !READ_ONCE(sk->sk_err) &&
+				    !signal_pending(current))
+					timeo = schedule_timeout(timeo);
+				finish_wait(sk_sleep(sk), &wait);
+				if ((READ_ONCE(ring->head) - smp_load_acquire(&ring->tail)) < READ_ONCE(ring->size))
+					WRITE_ONCE(u->tx_ring_full, false);
+
+				err = sock_error(sk);
+				if (unlikely(err))
+					return sent ?: err;
+				continue;
+			}
+		}
+
+		if (unlikely(READ_ONCE(u->tx_ring_full)))
+			WRITE_ONCE(u->tx_ring_full, false);
+
+		space = rsize - avail;
+		chunk = min3(total_len - sent, (size_t)space, (size_t)32768UL);
+		pos = head;
+
+		while (batch < chunk && seg_idx < nr_segs) {
+			size_t srem = iov[seg_idx].iov_len - seg_off;
+			size_t copy_len, first;
+			const u8 __user *src;
+			u32 off;
+
+			if (unlikely(!srem)) {
+				seg_idx++;
+				seg_off = 0;
+				continue;
+			}
+
+			copy_len = min_t(size_t, srem, chunk - batch);
+			src = (const u8 __user *)iov[seg_idx].iov_base + seg_off;
+			off = (u32)pos & rmask;
+			first = min_t(size_t, copy_len, rsize - off);
+
+			nz_prefetchw_range(ring->buf + off, first);
+			if (unlikely(copy_from_user(ring->buf + off, src, first))) {
+				faulted = true;
+				break;
+			}
+			pos += first;
+			batch += first;
+			seg_off += first;
+
+			if (copy_len > first) {
+				size_t second = copy_len - first;
+
+				nz_prefetchw_range(ring->buf, second);
+				if (unlikely(copy_from_user(ring->buf,
+							    src + first,
+							    second))) {
+					faulted = true;
+					break;
+				}
+				pos += second;
+				batch += second;
+				seg_off += second;
+			}
+
+			if (seg_off == iov[seg_idx].iov_len) {
+				seg_idx++;
+				seg_off = 0;
+			}
+		}
+
+		if (unlikely(faulted || !batch)) {
+			unix_ring_prod_unlock(ring);
+			return sent ?: -EFAULT;
+		}
+		if (unlikely(atomic_read(&unix_sk(other)->scm_stat.nr_fds) > 0))
+			unix_ring_raise_drain_seq(ring, head + batch);
+		smp_store_release(&ring->head, head + batch);
+		unix_ring_prod_unlock(ring);
+		unix_notify_readable(other);
+		sent += batch;
+	}
+	return sent;
+}
+
+ssize_t unix_ring_direct_sendv(struct socket *sock,
+			       const struct iovec *iov,
+			       unsigned long nr_segs,
+			       size_t total_len,
+			       unsigned int flags,
+			       bool *handled)
+{
+	struct sock *sk = sock->sk;
+	struct unix_sock *u = unix_sk(sk);
+	struct sock *other;
+	struct unix_ring *ring;
+	int err;
+
+	if (unlikely(flags & (MSG_OOB | MSG_SPLICE_PAGES | MSG_MORE))) {
+		*handled = false;
+		return 0;
+	}
+
+	other = READ_ONCE(unix_peer(sk));
+	if (unlikely(!other ||
+		     (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) ||
+		     !READ_ONCE(other->sk_socket) ||
+		     READ_ONCE(other->sk_prot) != &unix_stream_proto ||
+		     unix_may_passcred(sk) ||
+		     unix_may_passcred(other) ||
+		     other->sk_scm_security)) {
+		*handled = false;
+		return 0;
+	}
+
+	if (unlikely(!total_len || !nr_segs)) {
+		err = sock_error(sk);
+
+		*handled = true;
+		if (unlikely(err))
+			return err;
+		if (unlikely(sock_flag(other, SOCK_DEAD) ||
+			     (READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN))) {
+			if (!(flags & MSG_NOSIGNAL))
+				send_sig(SIGPIPE, current, 0);
+			return -EPIPE;
+		}
+		return 0;
+	}
+
+	if (nr_segs == 1) {
+		if (unlikely(!access_ok(iov[0].iov_base, total_len))) {
+			*handled = true;
+			return -EFAULT;
+		}
+		ring = unix_ring_get_or_alloc(other, total_len);
+		if (unlikely(!ring)) {
+			*handled = false;
+			return 0;
+		}
+		*handled = true;
+		return unix_ring_send_ubuf(sk, other, ring, iov[0].iov_base,
+					   total_len, flags);
+	}
+
+	if (unlikely(!unix_ring_iov_access_ok(iov, nr_segs, total_len))) {
+		*handled = true;
+		return -EFAULT;
+	}
+
+	ring = unix_ring_get_or_alloc(other, total_len);
+	if (unlikely(!ring)) {
+		*handled = false;
+		return 0;
+	}
+
+	*handled = true;
+	err = sock_error(sk);
+	if (unlikely(err))
+		return err;
+
+	/*
+	 * Single-shot mutex-free in-atomic fusion for multi-iovec messages
+	 * (dbus-broker, libwayland) <= 4 KiB: ONE lock acquire, ONE SMAP
+	 * window, ONE head release store, ONE unix_notify_readable().
+	 */
+	if (likely(total_len <= UNIX_RING_ATOMIC_MAX) &&
+	    likely(unix_ring_prod_try_fast(ring))) {
+		if (likely(!sock_flag(other, SOCK_DEAD) &&
+			   !(READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) &&
+			   !(READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) &&
+			   ring->buf)) {
+			u32 rsize = ring->size;
+			u32 rmask = ring->mask;
+			u64 head = ring->head;
+			u64 avail = head - ring->cached_tail;
+
+			if (unlikely(avail + total_len > rsize)) {
+				ring->cached_tail = smp_load_acquire(&ring->tail);
+				avail = head - ring->cached_tail;
+			}
+			if (likely(avail + total_len <= rsize)) {
+				if (likely(unix_ring_copy_iov_inatomic(ring, head,
+								       rsize, rmask,
+								       iov, nr_segs,
+								       total_len))) {
+					if (unlikely(READ_ONCE(u->tx_ring_full)))
+						WRITE_ONCE(u->tx_ring_full, false);
+					if (unlikely(atomic_read(&unix_sk(other)->scm_stat.nr_fds) > 0))
+						unix_ring_raise_drain_seq(ring, head + total_len);
+					smp_store_release(&ring->head, head + total_len);
+					unix_ring_prod_unlock_fast(ring);
+					unix_notify_readable(other);
+					return (ssize_t)total_len;
+				}
+			}
+		}
+		unix_ring_prod_unlock_fast(ring);
+	}
+
+	return unix_ring_direct_sendv_slow(sk, other, ring, iov, nr_segs,
+					   total_len, flags);
+}
+EXPORT_SYMBOL(unix_ring_direct_sendv);
+
 static int unix_ring_sendmsg(struct sock *sk, struct sock *other,
 			     struct unix_ring *ring, struct msghdr *msg,
 			     size_t len)
@@ -2867,17 +3696,59 @@ static int unix_ring_sendmsg(struct sock *sk, struct sock *other,
 	if (unlikely(err))
 		return err;
 
+	if (len <= UNIX_RING_ATOMIC_MAX &&
+	    iter_is_iovec(&msg->msg_iter) &&
+	    msg->msg_iter.nr_segs <= 4 &&
+	    !msg->msg_iter.iov_offset) {
+		const struct iovec *iov = iter_iov(&msg->msg_iter);
+		unsigned long nr_segs = msg->msg_iter.nr_segs;
+
+		if (likely(unix_ring_iov_access_ok(iov, nr_segs, len)) &&
+		    likely(unix_ring_prod_try_fast(ring))) {
+			if (likely(!sock_flag(other, SOCK_DEAD) &&
+				   !(READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) &&
+				   !(READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) &&
+				   ring->buf)) {
+				u32 rsize = ring->size;
+				u32 rmask = ring->mask;
+				u64 head = ring->head;
+				u64 avail = head - ring->cached_tail;
+
+				if (unlikely(avail + len > rsize)) {
+					ring->cached_tail = smp_load_acquire(&ring->tail);
+					avail = head - ring->cached_tail;
+				}
+				if (likely(avail + len <= rsize) &&
+				    likely(unix_ring_copy_iov_inatomic(ring, head,
+								       rsize, rmask,
+								       iov, nr_segs,
+								       len))) {
+					if (unlikely(READ_ONCE(u->tx_ring_full)))
+						WRITE_ONCE(u->tx_ring_full, false);
+					if (unlikely(atomic_read(&unix_sk(other)->scm_stat.nr_fds) > 0))
+						unix_ring_raise_drain_seq(ring, head + len);
+					smp_store_release(&ring->head, head + len);
+					unix_ring_prod_unlock_fast(ring);
+					unix_notify_readable(other);
+					iov_iter_advance(&msg->msg_iter, len);
+					return (int)len;
+				}
+			}
+			unix_ring_prod_unlock_fast(ring);
+		}
+	}
+
 	while (sent < len) {
 		u64 head, avail, space;
 		size_t chunk, first;
 		u32 off, rsize, rmask;
 
-		mutex_lock(&ring->prod_lock);
+		unix_ring_prod_lock(ring);
 		if (unlikely(sock_flag(other, SOCK_DEAD) ||
 			     (READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) ||
 			     (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) ||
 			     !ring->buf)) {
-			mutex_unlock(&ring->prod_lock);
+			unix_ring_prod_unlock(ring);
 			if (!sent && !(msg->msg_flags & MSG_NOSIGNAL))
 				send_sig(SIGPIPE, current, 0);
 			return sent ?: -EPIPE;
@@ -2893,15 +3764,17 @@ static int unix_ring_sendmsg(struct sock *sk, struct sock *other,
 			if (avail >= rsize) {
 				DEFINE_WAIT(wait);
 
-				if (ring->order < UNIX_RING_MAX_ORDER &&
-				    len >= 4096) {
-					mutex_unlock(&ring->prod_lock);
+				if (ring->order < UNIX_RING_MAX_ORDER) {
+					unix_ring_prod_unlock(ring);
 					unix_ring_try_expand(other, ring);
 					if (READ_ONCE(ring->size) > rsize)
 						continue;
-					mutex_lock(&ring->prod_lock);
-					if (unlikely(!ring->buf)) {
-						mutex_unlock(&ring->prod_lock);
+					unix_ring_prod_lock(ring);
+					if (unlikely(!ring->buf ||
+						     sock_flag(other, SOCK_DEAD) ||
+						     (READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) ||
+						     (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN))) {
+						unix_ring_prod_unlock(ring);
 						continue;
 					}
 					rsize = ring->size;
@@ -2914,10 +3787,10 @@ static int unix_ring_sendmsg(struct sock *sk, struct sock *other,
 				ring->cached_tail = smp_load_acquire(&ring->tail);
 				if (head - ring->cached_tail < rsize) {
 					WRITE_ONCE(u->tx_ring_full, false);
-					mutex_unlock(&ring->prod_lock);
+					unix_ring_prod_unlock(ring);
 					continue;
 				}
-				mutex_unlock(&ring->prod_lock);
+				unix_ring_prod_unlock(ring);
 
 				if (timeo < 0)
 					timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
@@ -2938,6 +3811,8 @@ static int unix_ring_sendmsg(struct sock *sk, struct sock *other,
 				    !signal_pending(current))
 					timeo = schedule_timeout(timeo);
 				finish_wait(sk_sleep(sk), &wait);
+				if ((READ_ONCE(ring->head) - smp_load_acquire(&ring->tail)) < READ_ONCE(ring->size))
+					WRITE_ONCE(u->tx_ring_full, false);
 
 				err = sock_error(sk);
 				if (unlikely(err))
@@ -2956,7 +3831,7 @@ static int unix_ring_sendmsg(struct sock *sk, struct sock *other,
 
 		nz_prefetchw_range(ring->buf + off, first);
 		if (unlikely(copy_from_iter(ring->buf + off, first, &msg->msg_iter) != first)) {
-			mutex_unlock(&ring->prod_lock);
+			unix_ring_prod_unlock(ring);
 			return sent ?: -EFAULT;
 		}
 		if (chunk > first) {
@@ -2964,19 +3839,300 @@ static int unix_ring_sendmsg(struct sock *sk, struct sock *other,
 
 			nz_prefetchw_range(ring->buf, second);
 			if (unlikely(copy_from_iter(ring->buf, second, &msg->msg_iter) != second)) {
-				smp_store_release(&ring->head, head + first);
-				mutex_unlock(&ring->prod_lock);
-				unix_notify_readable(other);
-				sent += first;
+				unix_ring_prod_unlock(ring);
 				return sent ?: -EFAULT;
 			}
 		}
 
+		if (unlikely(atomic_read(&unix_sk(other)->scm_stat.nr_fds) > 0))
+			unix_ring_raise_drain_seq(ring, head + chunk);
 		smp_store_release(&ring->head, head + chunk);
-		mutex_unlock(&ring->prod_lock);
+		unix_ring_prod_unlock(ring);
 
 		unix_notify_readable(other);
 		sent += chunk;
+	}
+	return sent;
+}
+
+static inline void unix_ring_commit_fd_slot(struct unix_sock *otheru,
+					    struct unix_ring *ring,
+					    struct unix_ring_fd_ring *fdr,
+					    u64 ring_seq, u32 msg_len,
+					    struct file **fp, int fd_count)
+{
+	u64 fd_head = fdr->fd_head;
+	struct unix_ring_fd_slot *slot =
+		&fdr->slots[fd_head & UNIX_RING_FD_MASK];
+	int i;
+
+	slot->ring_seq = ring_seq;
+	slot->msg_len = msg_len;
+	slot->count = (u8)fd_count;
+	for (i = 0; i < fd_count; i++)
+		slot->fp[i] = fp[i];
+	atomic_add(fd_count, &otheru->scm_stat.nr_fds);
+	unix_ring_raise_drain_seq(ring, ring_seq + msg_len);
+	/*
+	 * Release-publish fd_head BEFORE release-publishing ring->head so any
+	 * consumer observing head > ring_seq is guaranteed to see fd_ring,
+	 * fd_head, drain_until_seq, and the populated slot fields.
+	 */
+	smp_store_release(&fdr->fd_head, fd_head + 1);
+}
+
+static int unix_ring_sendmsg_fds(struct sock *sk, struct sock *other,
+				 struct unix_ring *ring,
+				 struct unix_ring_fd_ring *fdr,
+				 struct msghdr *msg, size_t len,
+				 struct file **fp, int fd_count,
+				 bool *fallback)
+{
+	struct unix_sock *u = unix_sk(sk);
+	struct unix_sock *otheru = unix_sk(other);
+	unsigned long nofile_lim = task_rlimit(current, RLIMIT_NOFILE);
+	bool fds_committed = false;
+	long timeo = -1;
+	size_t sent = 0;
+	int err;
+
+	*fallback = false;
+
+	err = sock_error(sk);
+	if (unlikely(err)) {
+		unix_ring_fput_array(fp, fd_count);
+		return err;
+	}
+
+	/*
+	 * Mutex-free in-atomic fastpath for <= 4 KiB inline SCM_RIGHTS sends
+	 * (Wayland DMA-BUF, PipeWire memfd, D-Bus portals).
+	 */
+	if (likely(len <= UNIX_RING_ATOMIC_MAX)) {
+		bool is_ubuf = iter_is_ubuf(&msg->msg_iter);
+		bool is_iov = !is_ubuf && iter_is_iovec(&msg->msg_iter) &&
+			      msg->msg_iter.nr_segs <= 4 &&
+			      !msg->msg_iter.iov_offset;
+		const u8 __user *ubuf = is_ubuf ?
+			(msg->msg_iter.ubuf + msg->msg_iter.iov_offset) : NULL;
+		const struct iovec *iov = is_iov ? iter_iov(&msg->msg_iter) : NULL;
+		unsigned long nr_segs = is_iov ? msg->msg_iter.nr_segs : 0;
+
+		if (likely((is_ubuf && access_ok(ubuf, len)) ||
+			   (is_iov && unix_ring_iov_access_ok(iov, nr_segs, len))) &&
+		    likely(unix_ring_prod_try_fast(ring))) {
+			if (likely(!sock_flag(other, SOCK_DEAD) &&
+				   !(READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) &&
+				   !(READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) &&
+				   ring->buf &&
+				   other->sk_scm_rights &&
+				   !unix_may_passcred(sk) &&
+				   !unix_may_passcred(other) &&
+				   !other->sk_scm_security &&
+				   (fdr->fd_head - smp_load_acquire(&fdr->fd_tail)) < UNIX_RING_FD_SLOTS &&
+				   (unsigned long)atomic_read(&otheru->scm_stat.nr_fds) <= nofile_lim)) {
+				u32 rsize = ring->size;
+				u32 rmask = ring->mask;
+				u64 head = ring->head;
+				u64 avail = head - ring->cached_tail;
+
+				if (unlikely(avail + len > rsize)) {
+					ring->cached_tail = smp_load_acquire(&ring->tail);
+					avail = head - ring->cached_tail;
+				}
+				if (likely(avail + len <= rsize)) {
+					bool ok;
+
+					if (is_ubuf) {
+						u32 off = (u32)head & rmask;
+						size_t first = min_t(size_t, len, rsize - off);
+
+						nz_prefetchw_range(ring->buf + off, first);
+						ok = !unix_ring_copy_from_user_inatomic(ring->buf + off,
+											ubuf, first);
+						if (ok && unlikely(len > first)) {
+							size_t second = len - first;
+
+							nz_prefetchw_range(ring->buf, second);
+							ok = !unix_ring_copy_from_user_inatomic(ring->buf,
+												ubuf + first,
+												second);
+						}
+					} else {
+						ok = unix_ring_copy_iov_inatomic(ring, head,
+										 rsize, rmask,
+										 iov, nr_segs,
+										 len);
+					}
+					if (likely(ok)) {
+						if (unlikely(READ_ONCE(u->tx_ring_full)))
+							WRITE_ONCE(u->tx_ring_full, false);
+						unix_ring_commit_fd_slot(otheru, ring, fdr,
+									 head, (u32)len,
+									 fp, fd_count);
+						smp_store_release(&ring->head, head + len);
+						unix_ring_prod_unlock_fast(ring);
+						unix_notify_readable(other);
+						iov_iter_advance(&msg->msg_iter, len);
+						return (int)len;
+					}
+				}
+			}
+			unix_ring_prod_unlock_fast(ring);
+		}
+	}
+
+	while (sent < len) {
+		u64 head, avail, space;
+		size_t chunk, first, got1, got2 = 0, total_got;
+		u32 off, rsize, rmask;
+
+		unix_ring_prod_lock(ring);
+		if (unlikely(sock_flag(other, SOCK_DEAD) ||
+			     (READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) ||
+			     (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) ||
+			     !ring->buf)) {
+			unix_ring_prod_unlock(ring);
+			if (!fds_committed)
+				unix_ring_fput_array(fp, fd_count);
+			if (!sent && !(msg->msg_flags & MSG_NOSIGNAL))
+				send_sig(SIGPIPE, current, 0);
+			return sent ?: -EPIPE;
+		}
+
+		if (!fds_committed) {
+			if (unlikely(!other->sk_scm_rights ||
+				     unix_may_passcred(sk) ||
+				     unix_may_passcred(other) ||
+				     other->sk_scm_security ||
+				     (fdr->fd_head - smp_load_acquire(&fdr->fd_tail)) >= UNIX_RING_FD_SLOTS ||
+				     (unsigned long)atomic_read(&otheru->scm_stat.nr_fds) > nofile_lim)) {
+				unix_ring_prod_unlock(ring);
+				unix_ring_fput_array(fp, fd_count);
+				*fallback = true;
+				return 0;
+			}
+		}
+
+		rsize = ring->size;
+		rmask = ring->mask;
+		head = ring->head;
+		avail = head - ring->cached_tail;
+		if (unlikely(avail >= rsize)) {
+			ring->cached_tail = smp_load_acquire(&ring->tail);
+			avail = head - ring->cached_tail;
+			if (avail >= rsize) {
+				DEFINE_WAIT(wait);
+
+				if (ring->order < UNIX_RING_MAX_ORDER) {
+					unix_ring_prod_unlock(ring);
+					unix_ring_try_expand(other, ring);
+					if (READ_ONCE(ring->size) > rsize)
+						continue;
+					unix_ring_prod_lock(ring);
+					if (unlikely(!ring->buf ||
+						     sock_flag(other, SOCK_DEAD) ||
+						     (READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) ||
+						     (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN))) {
+						unix_ring_prod_unlock(ring);
+						continue;
+					}
+					rsize = ring->size;
+					head = ring->head;
+				}
+
+				WRITE_ONCE(u->tx_ring_full, true);
+				WRITE_ONCE(ring->prod_throttled, 1);
+				smp_mb();
+				ring->cached_tail = smp_load_acquire(&ring->tail);
+				if (head - ring->cached_tail < rsize) {
+					WRITE_ONCE(u->tx_ring_full, false);
+					unix_ring_prod_unlock(ring);
+					continue;
+				}
+				unix_ring_prod_unlock(ring);
+
+				if (timeo < 0)
+					timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+				if (!timeo) {
+					if (!fds_committed)
+						unix_ring_fput_array(fp, fd_count);
+					return sent ?: -EAGAIN;
+				}
+				if (signal_pending(current)) {
+					if (!fds_committed)
+						unix_ring_fput_array(fp, fd_count);
+					return sent ?: sock_intr_errno(timeo);
+				}
+
+				prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+				WRITE_ONCE(u->tx_ring_full, true);
+				WRITE_ONCE(ring->prod_throttled, 1);
+				smp_mb();
+				if ((READ_ONCE(ring->head) - smp_load_acquire(&ring->tail)) >= READ_ONCE(ring->size) &&
+				    !sock_flag(other, SOCK_DEAD) &&
+				    !(READ_ONCE(other->sk_shutdown) & RCV_SHUTDOWN) &&
+				    !(READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) &&
+				    !READ_ONCE(sk->sk_err) &&
+				    !signal_pending(current))
+					timeo = schedule_timeout(timeo);
+				finish_wait(sk_sleep(sk), &wait);
+				if ((READ_ONCE(ring->head) - smp_load_acquire(&ring->tail)) < READ_ONCE(ring->size))
+					WRITE_ONCE(u->tx_ring_full, false);
+
+				err = sock_error(sk);
+				if (unlikely(err)) {
+					if (!fds_committed)
+						unix_ring_fput_array(fp, fd_count);
+					return sent ?: err;
+				}
+				continue;
+			}
+		}
+
+		if (unlikely(READ_ONCE(u->tx_ring_full)))
+			WRITE_ONCE(u->tx_ring_full, false);
+
+		space = rsize - avail;
+		chunk = min3(len - sent, (size_t)space, (size_t)32768UL);
+		off = (u32)head & rmask;
+		first = min_t(size_t, chunk, rsize - off);
+
+		nz_prefetchw_range(ring->buf + off, first);
+		got1 = copy_from_iter(ring->buf + off, first, &msg->msg_iter);
+		if (unlikely(got1 != first)) {
+			unix_ring_prod_unlock(ring);
+			if (!fds_committed)
+				unix_ring_fput_array(fp, fd_count);
+			return sent ?: -EFAULT;
+		}
+		if (chunk > first) {
+			size_t second = chunk - first;
+
+			nz_prefetchw_range(ring->buf, second);
+			got2 = copy_from_iter(ring->buf, second, &msg->msg_iter);
+			if (unlikely(got2 != second)) {
+				unix_ring_prod_unlock(ring);
+				if (!fds_committed)
+					unix_ring_fput_array(fp, fd_count);
+				return sent ?: -EFAULT;
+			}
+		}
+		total_got = got1 + got2;
+
+		if (!fds_committed) {
+			unix_ring_commit_fd_slot(otheru, ring, fdr, head,
+						 (u32)total_got, fp, fd_count);
+			fds_committed = true;
+		} else {
+			unix_ring_raise_drain_seq(ring, head + total_got);
+		}
+
+		smp_store_release(&ring->head, head + total_got);
+		unix_ring_prod_unlock(ring);
+
+		unix_notify_readable(other);
+		sent += total_got;
 	}
 	return sent;
 }
@@ -3021,6 +4177,43 @@ int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 			ring = unix_ring_get_or_alloc(other, len);
 			if (likely(ring))
 				return unix_ring_sendmsg(sk, other, ring, msg, len);
+		}
+	} else if (msg->msg_controllen > 0 && len > 0 &&
+		   !(msg->msg_flags & (MSG_OOB | MSG_SPLICE_PAGES | MSG_CMSG_COMPAT)) &&
+		   !msg->msg_namelen && !msg->msg_control_is_user) {
+		other = READ_ONCE(unix_peer(sk));
+		if (likely(other &&
+			   !(READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) &&
+			   READ_ONCE(other->sk_socket) &&
+			   READ_ONCE(other->sk_prot) == &unix_stream_proto &&
+			   other->sk_scm_rights &&
+			   !unix_may_passcred(sk) &&
+			   !unix_may_passcred(other) &&
+			   !other->sk_scm_security &&
+			   !too_many_unix_fds(current))) {
+			struct file *fp[UNIX_RING_FD_MAX];
+			int fd_count = 0;
+
+			if (unix_ring_extract_inline_fds(msg, fp, &fd_count)) {
+				struct unix_ring *ring =
+					unix_ring_get_or_alloc(other, len);
+				struct unix_ring_fd_ring *fdr =
+					likely(ring) ? unix_ring_get_or_alloc_fdr(ring) : NULL;
+
+				if (likely(fdr)) {
+					bool fallback = false;
+					int ret = unix_ring_sendmsg_fds(sk, other,
+									ring, fdr,
+									msg, len,
+									fp, fd_count,
+									&fallback);
+
+					if (likely(!fallback))
+						return ret;
+				} else {
+					unix_ring_fput_array(fp, fd_count);
+				}
+			}
 		}
 	}
 
@@ -3111,7 +4304,7 @@ int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 
 		ring = smp_load_acquire(&otheru->rx_ring);
 		if (ring)
-			mutex_lock(&ring->prod_lock);
+			unix_ring_prod_lock(ring);
 
 		unix_state_lock(other);
 
@@ -3119,14 +4312,14 @@ int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 		    (other->sk_shutdown & RCV_SHUTDOWN)) {
 			unix_state_unlock(other);
 			if (ring)
-				mutex_unlock(&ring->prod_lock);
+				unix_ring_prod_unlock(ring);
 			goto out_pipe;
 		}
 
 		if (UNIXCB(skb).fp && !other->sk_scm_rights) {
 			unix_state_unlock(other);
 			if (ring)
-				mutex_unlock(&ring->prod_lock);
+				unix_ring_prod_unlock(ring);
 			err = -EPERM;
 			goto out_free;
 		}
@@ -3143,7 +4336,7 @@ int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 
 		unix_state_unlock(other);
 		if (ring)
-			mutex_unlock(&ring->prod_lock);
+			unix_ring_prod_unlock(ring);
 		unix_notify_readable(other);
 		sent += size;
 	}
@@ -3416,14 +4609,14 @@ static int unix_stream_recv_urg(struct unix_stream_read_state *state)
 	struct unix_sock *u = unix_sk(sk);
 	int chunk = 1;
 
-	mutex_lock(&u->iolock);
+	unix_io_lock(u);
 	unix_state_lock(sk);
 	spin_lock(&sk->sk_receive_queue.lock);
 
 	if (sock_flag(sk, SOCK_URGINLINE) || !u->oob_skb) {
 		spin_unlock(&sk->sk_receive_queue.lock);
 		unix_state_unlock(sk);
-		mutex_unlock(&u->iolock);
+		unix_io_unlock(u);
 		return -EINVAL;
 	}
 
@@ -3448,7 +4641,7 @@ static int unix_stream_recv_urg(struct unix_stream_read_state *state)
 	if (!(state->flags & MSG_PEEK))
 		UNIXCB(oob_skb).consumed += 1;
 
-	mutex_unlock(&u->iolock);
+	unix_io_unlock(u);
 
 	consume_skb(read_skb);
 
@@ -3530,13 +4723,13 @@ static int unix_stream_read_skb(struct sock *sk, skb_read_actor_t recv_actor)
 	if (err)
 		return err;
 
-	mutex_lock(&u->iolock);
+	unix_io_lock(u);
 	spin_lock(&queue->lock);
 
 	skb = __skb_dequeue(queue);
 	if (!skb) {
 		spin_unlock(&queue->lock);
-		mutex_unlock(&u->iolock);
+		unix_io_unlock(u);
 		return -EAGAIN;
 	}
 
@@ -3546,7 +4739,7 @@ static int unix_stream_read_skb(struct sock *sk, skb_read_actor_t recv_actor)
 	if (skb == u->oob_skb) {
 		WRITE_ONCE(u->oob_skb, NULL);
 		spin_unlock(&queue->lock);
-		mutex_unlock(&u->iolock);
+		unix_io_unlock(u);
 
 		kfree_skb_reason(skb, SKB_DROP_REASON_UNIX_SKIP_OOB);
 		return -EAGAIN;
@@ -3557,25 +4750,47 @@ static int unix_stream_read_skb(struct sock *sk, skb_read_actor_t recv_actor)
 
 	unix_orphan_scm(sk, skb);
 
-	mutex_unlock(&u->iolock);
+	unix_io_unlock(u);
 
 	return recv_actor(sk, skb);
 }
 
-static inline void unix_ring_maybe_wake_peer(struct sock *sk,
+static inline void unix_ring_wake_peer_write(struct sock *sk)
+{
+	struct sock *peer = unix_peer_get(sk);
+
+	if (likely(peer)) {
+		unix_write_space(peer);
+		sock_put(peer);
+	}
+}
+
+/*
+ * Wake throttled producers crossing the 75% watermark AND any EPOLLET|EPOLLOUT
+ * sender waiting for queued bytes / SCM_RIGHTS messages to drain (e.g.
+ * dbus-broker's ioctl(SIOCOUTQ) <= 128 check in socket_dispatch_write()).
+ * Plain sockets with no SCM_RIGHTS or SIOCOUTQ traffic have drain_until_seq == 0
+ * so old_tail >= dseq exits immediately in 0 extra cycles.
+ */
+static inline bool unix_ring_maybe_wake_peer(struct sock *sk,
 					     struct unix_ring *ring,
-					     u64 old_used, size_t got)
+					     u64 old_tail, u64 old_used,
+					     size_t got)
 {
 	u32 rsize = READ_ONCE(ring->size);
-	u32 thresh = rsize >> 1;
+	u32 thresh = rsize - (rsize >> 2);
+	u64 dseq = READ_ONCE(ring->drain_until_seq);
 
 	if (likely(old_used < thresh && got < (rsize >> 2) &&
-		   !READ_ONCE(ring->prod_throttled)))
-		return;
+		   !READ_ONCE(ring->prod_throttled) &&
+		   likely(old_tail >= dseq)))
+		return false;
 
 	smp_mb();
 	if (unlikely(READ_ONCE(ring->prod_throttled))) {
-		u64 used = smp_load_acquire(&ring->head) - READ_ONCE(ring->tail);
+		u64 tail = READ_ONCE(ring->tail);
+		u64 head = smp_load_acquire(&ring->head);
+		u64 used = head > tail ? head - tail : 0;
 
 		if (used <= thresh) {
 			struct sock *peer;
@@ -3586,9 +4801,105 @@ static inline void unix_ring_maybe_wake_peer(struct sock *sk,
 				WRITE_ONCE(unix_sk(peer)->tx_ring_full, false);
 				unix_write_space(peer);
 				sock_put(peer);
+				return true;
 			}
 		}
 	}
+	if (unlikely(old_tail < dseq)) {
+		unix_ring_wake_peer_write(sk);
+		return true;
+	}
+	return false;
+}
+
+static inline int unix_ring_pop_fd_slot(struct unix_sock *u,
+					struct unix_ring_fd_ring *fdr,
+					u64 fd_tail,
+					struct file *out_fp[UNIX_RING_FD_MAX])
+{
+	struct unix_ring_fd_slot *slot =
+		&fdr->slots[fd_tail & UNIX_RING_FD_MASK];
+	int count = slot->count;
+	int i;
+
+	for (i = 0; i < count; i++) {
+		out_fp[i] = slot->fp[i];
+		slot->fp[i] = NULL;
+	}
+	slot->count = 0;
+	smp_store_release(&fdr->fd_tail, fd_tail + 1);
+	atomic_sub(count, &u->scm_stat.nr_fds);
+	return count;
+}
+
+static inline bool unix_ring_copy_to_iov_inatomic(struct unix_ring *ring,
+						  u64 tail, u32 rsize, u32 rmask,
+						  const struct iovec *iov,
+						  unsigned long nr_segs,
+						  size_t rchunk)
+{
+	u64 pos = tail;
+	size_t rem = rchunk;
+	unsigned long seg;
+#if defined(CONFIG_X86_64) && !defined(CONFIG_KASAN) && !defined(CONFIG_KMSAN)
+	u8 *rbuf = ring->buf;
+	bool ok = true;
+
+	stac();
+	for (seg = 0; seg < nr_segs && rem > 0; seg++) {
+		size_t slen = min_t(size_t, iov[seg].iov_len, rem);
+		u8 __user *dbase = iov[seg].iov_base;
+		u32 off;
+		size_t first;
+
+		if (unlikely(!slen))
+			continue;
+		off = (u32)pos & rmask;
+		first = min_t(size_t, slen, rsize - off);
+		if (unlikely(unix_ring_copy_user_smap((__force void *)dbase,
+						      rbuf + off, first))) {
+			ok = false;
+			break;
+		}
+		if (unlikely(slen > first)) {
+			if (unlikely(unix_ring_copy_user_smap((__force void *)(dbase + first),
+							      rbuf,
+							      slen - first))) {
+				ok = false;
+				break;
+			}
+		}
+		pos += slen;
+		rem -= slen;
+	}
+	clac();
+	return ok && rem == 0;
+#else
+	for (seg = 0; seg < nr_segs && rem > 0; seg++) {
+		size_t slen = min_t(size_t, iov[seg].iov_len, rem);
+		u8 __user *dbase = iov[seg].iov_base;
+		u32 off;
+		size_t first;
+
+		if (unlikely(!slen))
+			continue;
+		off = (u32)pos & rmask;
+		first = min_t(size_t, slen, rsize - off);
+		if (unlikely(unix_ring_copy_to_user_inatomic(dbase,
+							     ring->buf + off,
+							     first)))
+			return false;
+		if (unlikely(slen > first)) {
+			if (unlikely(unix_ring_copy_to_user_inatomic(dbase + first,
+								     ring->buf,
+								     slen - first)))
+				return false;
+		}
+		pos += slen;
+		rem -= slen;
+	}
+	return rem == 0;
+#endif
 }
 
 static int unix_stream_read_generic(struct unix_stream_read_state *state,
@@ -3601,6 +4912,9 @@ static int unix_stream_read_generic(struct unix_stream_read_state *state,
 	size_t size = state->size;
 	int flags = state->flags;
 	bool check_creds = false;
+	struct file *ring_fds[UNIX_RING_FD_MAX];
+	int ring_fd_count = 0;
+	bool ring_fd_woke_peer = false;
 	struct scm_cookie scm;
 	struct unix_sock *u;
 	int copied = 0;
@@ -3633,7 +4947,7 @@ redo:
 	/* Lock the socket to prevent queue disordering
 	 * while sleeps in memcpy_tomsg
 	 */
-	mutex_lock(&u->iolock);
+	unix_io_lock(u);
 
 	skip = max(sk_peek_offset(sk, flags), 0);
 
@@ -3650,23 +4964,94 @@ redo:
 		last = skb = skb_peek(&sk->sk_receive_queue);
 
 		ring = smp_load_acquire(&u->rx_ring);
-		if (ring && ring->buf && msg) {
+		if (ring && ring->buf) {
 			u64 limit_seq = skb ? UNIXCB(skb).ring_seq : U64_MAX;
 			u64 tail = ring->tail;
 			u64 head = smp_load_acquire(&ring->head);
+			struct unix_ring_fd_ring *fdr = smp_load_acquire(&ring->fd_ring);
+			u64 fd_head = unlikely(fdr) ? smp_load_acquire(&fdr->fd_head) : 0;
+			u64 fd_tail = unlikely(fdr) ? fdr->fd_tail : 0;
 			u64 ring_end = min(head, limit_seq);
 			u64 ring_avail = ring_end > tail ? ring_end - tail : 0;
 
 			if (ring_avail > (u64)skip) {
+				struct unix_ring_fd_slot *peek_slot = NULL;
+				bool at_fd_slot = false;
+				bool hit_fd_boundary = false;
+				u64 read_seq = tail + (u64)skip;
 				size_t rchunk, first, got;
 				u32 off;
 
 				unix_state_unlock(sk);
+				if (unlikely(!msg)) {
+					if (!copied)
+						err = -EAGAIN;
+					break;
+				}
 				if (check_creds)
 					break;
 
-				rchunk = min_t(u64, ring_avail - skip, size);
-				off = (u32)(tail + skip) & ring->mask;
+				if (unlikely(fdr && fd_tail != fd_head)) {
+					if (!(flags & MSG_PEEK)) {
+						struct unix_ring_fd_slot *slot =
+							&fdr->slots[fd_tail & UNIX_RING_FD_MASK];
+
+						if (tail < slot->ring_seq) {
+							if (slot->ring_seq < ring_end)
+								ring_end = slot->ring_seq;
+							hit_fd_boundary = true;
+						} else if (tail == slot->ring_seq) {
+							u64 slot_end = slot->ring_seq +
+								       (u64)slot->msg_len;
+
+							if (slot_end < ring_end)
+								ring_end = slot_end;
+							at_fd_slot = true;
+						}
+					} else {
+						u64 fidx = fd_tail;
+
+						while (fidx != fd_head) {
+							struct unix_ring_fd_slot *slot =
+								&fdr->slots[fidx & UNIX_RING_FD_MASK];
+							u64 slot_end = slot->ring_seq +
+								       (u64)slot->msg_len;
+
+							if (read_seq >= slot_end) {
+								fidx++;
+								continue;
+							}
+							if (read_seq < slot->ring_seq) {
+								if (slot->ring_seq < ring_end)
+									ring_end = slot->ring_seq;
+								hit_fd_boundary = true;
+							} else {
+								if (slot_end < ring_end)
+									ring_end = slot_end;
+								peek_slot = slot;
+							}
+							break;
+						}
+					}
+				}
+
+				if (unlikely(ring_end <= read_seq))
+					break;
+
+				if (unlikely(msg->msg_name) && !copied) {
+					struct sock *peer = unix_peer_get(sk);
+
+					if (peer) {
+						unix_copy_addr(msg, peer);
+						BPF_CGROUP_RUN_PROG_UNIX_RECVMSG_LOCK(sk,
+										      msg->msg_name,
+										      &msg->msg_namelen);
+						sock_put(peer);
+					}
+				}
+
+				rchunk = min_t(u64, ring_end - read_seq, size);
+				off = (u32)read_seq & ring->mask;
 				first = min_t(size_t, rchunk, ring->size - off);
 
 				got = copy_to_iter(ring->buf + off, first, &msg->msg_iter);
@@ -3682,19 +5067,44 @@ redo:
 				size -= got;
 
 				if (!(flags & MSG_PEEK)) {
+					bool woke;
+
+					if (unlikely(at_fd_slot))
+						ring_fd_count = unix_ring_pop_fd_slot(u, fdr,
+										      fd_tail,
+										      ring_fds);
 					smp_store_release(&ring->tail, tail + got);
 					ring->cached_head = head;
 					ring->last_rx_jiffies = jiffies;
 					sk_peek_offset_bwd(sk, got);
-					unix_ring_maybe_wake_peer(sk, ring,
-								  head - tail, got);
+					woke = unix_ring_maybe_wake_peer(sk, ring,
+									 tail,
+									 head - tail, got);
+					if (unlikely(at_fd_slot)) {
+						ring_fd_woke_peer = woke;
+						break;
+					}
+					if (hit_fd_boundary &&
+					    tail + got >= ring_end &&
+					    copied >= target)
+						break;
 					if (got < rchunk)
 						break;
 					continue;
 				}
 
+				if (unlikely(peek_slot)) {
+					int i;
+
+					ring_fd_count = peek_slot->count;
+					for (i = 0; i < ring_fd_count; i++)
+						ring_fds[i] = get_file(peek_slot->fp[i]);
+					sk_peek_offset_fwd(sk, got);
+					break;
+				}
+
 				sk_peek_offset_fwd(sk, got);
-				if (!skb || got < rchunk || !size)
+				if (hit_fd_boundary || !skb || got < rchunk || !size)
 					break;
 				skip = 0;
 				unix_state_lock(sk);
@@ -3738,7 +5148,7 @@ again:
 				break;
 			}
 
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 
 			timeo = unix_stream_data_wait(sk, timeo, last, freezable);
 
@@ -3841,11 +5251,16 @@ unlock:
 		}
 	} while (size);
 
-	mutex_unlock(&u->iolock);
+	unix_io_unlock(u);
 	if (msg) {
 		bool do_cmsg = READ_ONCE(u->recvmsg_inq);
 
 		scm_recv_unix(sock, msg, &scm, flags);
+		if (unlikely(ring_fd_count)) {
+			unix_ring_deliver_fds(sk, msg, ring_fds, ring_fd_count);
+			if (!(flags & MSG_PEEK) && !ring_fd_woke_peer)
+				unix_ring_wake_peer_write(sk);
+		}
 
 		if ((do_cmsg | msg->msg_get_inq) && (copied ?: err) >= 0) {
 			msg->msg_inq = unix_inq_len(sk);
@@ -3855,6 +5270,11 @@ unlock:
 		}
 	} else {
 		scm_destroy(&scm);
+		if (unlikely(ring_fd_count)) {
+			unix_ring_fput_array(ring_fds, ring_fd_count);
+			if (!(flags & MSG_PEEK) && !ring_fd_woke_peer)
+				unix_ring_wake_peer_write(sk);
+		}
 	}
 out:
 	return copied ? : err;
@@ -3913,81 +5333,82 @@ static inline void unix_ring_poll_spin(struct sock *sk, struct unix_sock *u)
 	}
 }
 
-ssize_t unix_ring_direct_recv(struct socket *sock, void __user *ubuf,
-			      size_t size, unsigned int flags, bool *handled)
+/*
+ * 100% lockless, zero-RMW check for empty non-blocking drains (covers BOTH
+ * rx_ring == NULL and rx_ring != NULL). Uses acquire + smp_rmb() + re-check
+ * so concurrent peer data/shutdown/error transitions are never missed.
+ */
+static inline bool unix_stream_empty_dontwait(struct sock *sk,
+					      struct unix_sock *u,
+					      struct unix_ring *ring)
 {
-	struct sock *sk = sock->sk;
-	struct unix_sock *u = unix_sk(sk);
+	if (!sock_flag(sk, SOCK_DEAD) &&
+	    skb_queue_empty_lockless(&sk->sk_receive_queue) &&
+	    (!ring || smp_load_acquire(&ring->head) == READ_ONCE(ring->tail))) {
+		smp_rmb();
+		ring = smp_load_acquire(&u->rx_ring);
+		if (likely(!READ_ONCE(sk->sk_err) &&
+			   !(READ_ONCE(sk->sk_shutdown) & RCV_SHUTDOWN) &&
+			   !sock_flag(sk, SOCK_DEAD) &&
+			   skb_queue_empty_lockless(&sk->sk_receive_queue) &&
+			   (!ring || READ_ONCE(ring->head) == READ_ONCE(ring->tail))))
+			return true;
+	}
+	return false;
+}
+
+static noinline ssize_t unix_ring_direct_recv_slow(struct sock *sk,
+						   struct unix_sock *u,
+						   void __user *ubuf,
+						   size_t size,
+						   unsigned int flags,
+						   bool *handled)
+{
 	long timeo = -1;
 
-#ifdef CONFIG_BPF_SYSCALL
-	if (unlikely(READ_ONCE(sk->sk_prot) != &unix_stream_proto)) {
-		*handled = false;
-		return 0;
-	}
-#endif
-	if (unlikely(!size ||
-		     READ_ONCE(sk->sk_state) != TCP_ESTABLISHED ||
-		     (flags & (MSG_OOB | MSG_PEEK | MSG_WAITALL | MSG_ERRQUEUE | MSG_TRUNC)) ||
-		     READ_ONCE(sk->sk_rcvlowat) > 1 ||
-		     READ_ONCE(sk->sk_peek_off) >= 0 ||
-		     unix_may_passcred(sk) ||
-		     sk->sk_scm_security ||
-		     READ_ONCE(u->recvmsg_inq) ||
-		     !skb_queue_empty_lockless(&sk->sk_receive_queue) ||
-		     !smp_load_acquire(&u->rx_ring))) {
-		*handled = false;
-		return 0;
-	}
-
-	if (unlikely(!access_ok(ubuf, size))) {
-		*handled = true;
-		return -EFAULT;
-	}
-
-	if (!(flags & MSG_DONTWAIT))
-		unix_ring_poll_spin(sk, u);
-
 retry:
-	mutex_lock(&u->iolock);
+	unix_io_lock(u);
 	if (unlikely(sock_flag(sk, SOCK_DEAD) ||
 		     READ_ONCE(sk->sk_peek_off) >= 0 ||
 		     unix_may_passcred(sk) ||
 		     sk->sk_scm_security ||
 		     READ_ONCE(u->recvmsg_inq))) {
-		mutex_unlock(&u->iolock);
+		unix_io_unlock(u);
 		*handled = false;
 		return 0;
 	}
 
 	{
 		struct unix_ring *ring = smp_load_acquire(&u->rx_ring);
-		u64 head, tail, avail;
+		struct unix_ring_fd_ring *fdr;
+		u64 head, tail, orig_avail, avail;
 		size_t rchunk, first, rem1, got;
 		u32 off;
 
 		if (unlikely(!ring || !ring->buf)) {
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 			*handled = false;
 			return 0;
 		}
 
 		head = smp_load_acquire(&ring->head);
+		fdr = smp_load_acquire(&ring->fd_ring);
 		if (unlikely(!skb_queue_empty_lockless(&sk->sk_receive_queue))) {
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 			*handled = false;
 			return 0;
 		}
 
 		tail = ring->tail;
-		avail = head > tail ? head - tail : 0;
+		orig_avail = head > tail ? head - tail : 0;
+		avail = orig_avail;
 		if (!avail) {
 			struct socket_wq *wq;
 			DEFINE_WAIT(wait);
 
 			if (unlikely(READ_ONCE(sk->sk_err) ||
 				     (READ_ONCE(sk->sk_shutdown) & RCV_SHUTDOWN))) {
-				mutex_unlock(&u->iolock);
+				unix_io_unlock(u);
 				*handled = false;
 				return 0;
 			}
@@ -3995,19 +5416,19 @@ retry:
 			if (timeo < 0)
 				timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
 			if (!timeo) {
-				mutex_unlock(&u->iolock);
+				unix_io_unlock(u);
 				*handled = true;
 				return -EAGAIN;
 			}
 
 			wq = rcu_dereference_protected(sk->sk_wq, 1);
 			if (unlikely(!wq || READ_ONCE(wq->fasync_list))) {
-				mutex_unlock(&u->iolock);
+				unix_io_unlock(u);
 				*handled = false;
 				return 0;
 			}
 
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 			if (signal_pending(current)) {
 				*handled = true;
 				return sock_intr_errno(timeo);
@@ -4029,6 +5450,32 @@ retry:
 				return sock_intr_errno(timeo);
 			}
 			goto retry;
+		}
+
+		if (unlikely(fdr)) {
+			u64 fd_head = smp_load_acquire(&fdr->fd_head);
+			u64 fd_tail = fdr->fd_tail;
+
+			if (fd_tail != fd_head) {
+				struct unix_ring_fd_slot *slot =
+					&fdr->slots[fd_tail & UNIX_RING_FD_MASK];
+
+				if (tail < slot->ring_seq) {
+					u64 to_slot = slot->ring_seq - tail;
+
+					if (to_slot < avail)
+						avail = to_slot;
+				} else {
+					/*
+					 * Hit SCM_RIGHTS boundary on read()/recv()
+					 * (no msg_control): let unix_stream_read_generic
+					 * consume and fput the unread fds + set MSG_CTRUNC.
+					 */
+					unix_io_unlock(u);
+					*handled = false;
+					return 0;
+				}
+			}
 		}
 
 		rchunk = min_t(u64, avail, size);
@@ -4045,7 +5492,7 @@ retry:
 		}
 
 		if (unlikely(!got)) {
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 			*handled = true;
 			return -EFAULT;
 		}
@@ -4053,12 +5500,150 @@ retry:
 		smp_store_release(&ring->tail, tail + got);
 		ring->cached_head = head;
 		ring->last_rx_jiffies = jiffies;
-		unix_ring_maybe_wake_peer(sk, ring, avail, got);
-		mutex_unlock(&u->iolock);
+		unix_io_unlock(u);
+		unix_ring_maybe_wake_peer(sk, ring, tail, orig_avail, got);
 
 		*handled = true;
 		return (ssize_t)got;
 	}
+}
+
+ssize_t unix_ring_direct_recv(struct socket *sock, void __user *ubuf,
+			      size_t size, unsigned int flags, bool *handled)
+{
+	struct sock *sk = sock->sk;
+	struct unix_sock *u = unix_sk(sk);
+	struct unix_ring *ring;
+
+#ifdef CONFIG_BPF_SYSCALL
+	if (unlikely(READ_ONCE(sk->sk_prot) != &unix_stream_proto)) {
+		*handled = false;
+		return 0;
+	}
+#endif
+	if (unlikely(!size ||
+		     READ_ONCE(sk->sk_state) != TCP_ESTABLISHED ||
+		     (flags & (MSG_OOB | MSG_PEEK | MSG_WAITALL | MSG_ERRQUEUE | MSG_TRUNC)) ||
+		     READ_ONCE(sk->sk_rcvlowat) > 1 ||
+		     READ_ONCE(sk->sk_peek_off) >= 0 ||
+		     unix_may_passcred(sk) ||
+		     sk->sk_scm_security ||
+		     READ_ONCE(u->recvmsg_inq))) {
+		*handled = false;
+		return 0;
+	}
+
+	if (unlikely(!access_ok(ubuf, size))) {
+		*handled = true;
+		return -EFAULT;
+	}
+
+	ring = smp_load_acquire(&u->rx_ring);
+	if ((flags & MSG_DONTWAIT) &&
+	    unix_stream_empty_dontwait(sk, u, ring)) {
+		*handled = true;
+		return -EAGAIN;
+	}
+
+	if (unlikely(!ring || !skb_queue_empty_lockless(&sk->sk_receive_queue))) {
+		*handled = false;
+		return 0;
+	}
+
+	if (!(flags & MSG_DONTWAIT))
+		unix_ring_poll_spin(sk, u);
+
+	/*
+	 * Mutex-free in-atomic fastpath for small (<= 4 KiB) uncontended reads.
+	 */
+	if (likely(unix_io_try_fast(u))) {
+		ring = smp_load_acquire(&u->rx_ring);
+
+		if (likely(!sock_flag(sk, SOCK_DEAD) &&
+			   READ_ONCE(sk->sk_peek_off) < 0 &&
+			   !unix_may_passcred(sk) &&
+			   !sk->sk_scm_security &&
+			   !READ_ONCE(u->recvmsg_inq) &&
+			   ring && ring->buf)) {
+			u64 head = smp_load_acquire(&ring->head);
+
+			if (likely(skb_queue_empty_lockless(&sk->sk_receive_queue))) {
+				u64 tail = ring->tail;
+				u64 orig_avail = head > tail ? head - tail : 0;
+				u64 avail = orig_avail;
+
+				if (!avail) {
+					if ((flags & MSG_DONTWAIT) &&
+					    !READ_ONCE(sk->sk_err) &&
+					    !(READ_ONCE(sk->sk_shutdown) & RCV_SHUTDOWN)) {
+						unix_io_unlock_fast(u);
+						*handled = true;
+						return -EAGAIN;
+					}
+				} else {
+					struct unix_ring_fd_ring *fdr =
+						smp_load_acquire(&ring->fd_ring);
+					bool fd_hit = false;
+
+					if (unlikely(fdr)) {
+						u64 fd_head = smp_load_acquire(&fdr->fd_head);
+						u64 fd_tail = fdr->fd_tail;
+
+						if (fd_tail != fd_head) {
+							struct unix_ring_fd_slot *slot =
+								&fdr->slots[fd_tail & UNIX_RING_FD_MASK];
+
+							if (tail < slot->ring_seq) {
+								u64 to_slot = slot->ring_seq - tail;
+
+								if (to_slot < avail)
+									avail = to_slot;
+							} else {
+								fd_hit = true;
+							}
+						}
+					}
+
+					if (likely(!fd_hit)) {
+						size_t rchunk = min_t(u64, avail, size);
+
+						if (likely(rchunk <= UNIX_RING_ATOMIC_MAX)) {
+							u32 rsize = ring->size;
+							u32 off = (u32)tail & ring->mask;
+							size_t first = min_t(size_t, rchunk, rsize - off);
+							bool ok;
+
+							ok = !unix_ring_copy_to_user_inatomic(ubuf,
+											      ring->buf + off,
+											      first);
+							if (ok && unlikely(rchunk > first))
+								ok = !unix_ring_copy_to_user_inatomic((u8 __user *)ubuf + first,
+												      ring->buf,
+												      rchunk - first);
+							if (likely(ok)) {
+								smp_store_release(&ring->tail, tail + rchunk);
+								ring->cached_head = head;
+								ring->last_rx_jiffies = jiffies;
+								unix_io_unlock_fast(u);
+								unix_ring_maybe_wake_peer(sk, ring,
+											  tail,
+											  orig_avail, rchunk);
+								*handled = true;
+								return (ssize_t)rchunk;
+							}
+						}
+					} else {
+						unix_io_unlock_fast(u);
+						*handled = false;
+						return 0;
+					}
+				}
+			}
+		}
+		unix_io_unlock_fast(u);
+	}
+
+	return unix_ring_direct_recv_slow(sk, u, ubuf, size, flags, handled);
 }
 EXPORT_SYMBOL(unix_ring_direct_recv);
 
@@ -4067,51 +5652,202 @@ static int unix_ring_recvmsg_fast(struct socket *sock, struct msghdr *msg,
 {
 	struct sock *sk = sock->sk;
 	struct unix_sock *u = unix_sk(sk);
+	struct file *ring_fds[UNIX_RING_FD_MAX];
+	int ring_fd_count = 0;
 	long timeo = -1;
 	bool do_cmsg;
 
 	if (!(flags & MSG_DONTWAIT))
 		unix_ring_poll_spin(sk, u);
 
+	/*
+	 * Mutex-free in-atomic fastpath for recvmsg() <= 4 KiB (including
+	 * inline 4-FD SCM_RIGHTS delivery for Wayland, PipeWire, and D-Bus!).
+	 */
+	{
+		bool is_ubuf = iter_is_ubuf(&msg->msg_iter);
+		bool is_iov = !is_ubuf && iter_is_iovec(&msg->msg_iter) &&
+			      msg->msg_iter.nr_segs <= 4 &&
+			      !msg->msg_iter.iov_offset;
+		u8 __user *ubuf = is_ubuf ?
+			(msg->msg_iter.ubuf + msg->msg_iter.iov_offset) : NULL;
+		const struct iovec *iov = is_iov ? iter_iov(&msg->msg_iter) : NULL;
+		unsigned long nr_segs = is_iov ? msg->msg_iter.nr_segs : 0;
+
+		if (likely((is_ubuf && access_ok(ubuf, size)) ||
+			   (is_iov && unix_ring_iov_access_ok(iov, nr_segs, size))) &&
+		    likely(unix_io_try_fast(u))) {
+			struct unix_ring *ring = smp_load_acquire(&u->rx_ring);
+
+			if (likely(!sock_flag(sk, SOCK_DEAD) &&
+				   READ_ONCE(sk->sk_peek_off) < 0 &&
+				   !unix_may_passcred(sk) &&
+				   !sk->sk_scm_security &&
+				   ring && ring->buf)) {
+				u64 head = smp_load_acquire(&ring->head);
+
+				if (likely(skb_queue_empty_lockless(&sk->sk_receive_queue))) {
+					u64 tail = ring->tail;
+					u64 orig_avail = head > tail ? head - tail : 0;
+					u64 avail = orig_avail;
+
+					if (!avail) {
+						if ((flags & MSG_DONTWAIT) &&
+						    !READ_ONCE(sk->sk_err) &&
+						    !(READ_ONCE(sk->sk_shutdown) & RCV_SHUTDOWN)) {
+							unix_io_unlock_fast(u);
+							*handled = true;
+							return -EAGAIN;
+						}
+					} else {
+						struct unix_ring_fd_ring *fdr =
+							smp_load_acquire(&ring->fd_ring);
+						u64 fd_tail = 0;
+						bool at_fd_slot = false;
+
+						if (unlikely(fdr)) {
+							u64 fd_head = smp_load_acquire(&fdr->fd_head);
+
+							fd_tail = fdr->fd_tail;
+							if (fd_tail != fd_head) {
+								struct unix_ring_fd_slot *slot =
+									&fdr->slots[fd_tail & UNIX_RING_FD_MASK];
+
+								if (tail < slot->ring_seq) {
+									u64 to_slot = slot->ring_seq - tail;
+
+									if (to_slot < avail)
+										avail = to_slot;
+								} else if (tail == slot->ring_seq) {
+									if ((u64)slot->msg_len < avail)
+										avail = slot->msg_len;
+									at_fd_slot = true;
+								}
+							}
+						}
+
+						if (likely(avail > 0)) {
+							size_t rchunk = min_t(u64, avail, size);
+
+							if (likely(rchunk <= UNIX_RING_ATOMIC_MAX)) {
+								u32 rsize = ring->size;
+								u32 rmask = ring->mask;
+								bool ok;
+
+								if (is_ubuf) {
+									u32 off = (u32)tail & rmask;
+									size_t first = min_t(size_t, rchunk, rsize - off);
+
+									ok = !unix_ring_copy_to_user_inatomic(ubuf,
+													      ring->buf + off,
+													      first);
+									if (ok && unlikely(rchunk > first))
+										ok = !unix_ring_copy_to_user_inatomic(ubuf + first,
+														      ring->buf,
+														      rchunk - first);
+								} else {
+									ok = unix_ring_copy_to_iov_inatomic(ring, tail,
+													    rsize, rmask,
+													    iov, nr_segs,
+													    rchunk);
+								}
+								if (likely(ok)) {
+									if (unlikely(at_fd_slot))
+										ring_fd_count = unix_ring_pop_fd_slot(u, fdr,
+														      fd_tail,
+														      ring_fds);
+									smp_store_release(&ring->tail, tail + rchunk);
+									ring->cached_head = head;
+									ring->last_rx_jiffies = jiffies;
+									unix_io_unlock_fast(u);
+									if (likely(!ring_fd_count))
+										unix_ring_maybe_wake_peer(sk, ring,
+													  tail,
+													  orig_avail, rchunk);
+									iov_iter_advance(&msg->msg_iter, rchunk);
+									if (unlikely(msg->msg_name)) {
+										struct sock *peer = unix_peer_get(sk);
+
+										if (peer) {
+											unix_copy_addr(msg, peer);
+											BPF_CGROUP_RUN_PROG_UNIX_RECVMSG_LOCK(sk,
+															      msg->msg_name,
+															      &msg->msg_namelen);
+											sock_put(peer);
+										}
+									}
+									if (unlikely(ring_fd_count)) {
+										unix_ring_deliver_fds(sk, msg,
+												      ring_fds,
+												      ring_fd_count);
+										if (!unix_ring_maybe_wake_peer(sk, ring,
+													       tail,
+													       orig_avail, rchunk))
+											unix_ring_wake_peer_write(sk);
+									}
+									do_cmsg = READ_ONCE(u->recvmsg_inq);
+									if (unlikely(do_cmsg | msg->msg_get_inq)) {
+										msg->msg_inq = unix_inq_len(sk);
+										if (do_cmsg)
+											put_cmsg(msg, SOL_SOCKET, SCM_INQ,
+												 sizeof(msg->msg_inq),
+												 &msg->msg_inq);
+									}
+									*handled = true;
+									return (int)rchunk;
+								}
+							}
+						}
+					}
+				}
+			}
+			unix_io_unlock_fast(u);
+		}
+	}
+
 retry:
-	mutex_lock(&u->iolock);
+	unix_io_lock(u);
 	if (unlikely(sock_flag(sk, SOCK_DEAD) ||
 		     READ_ONCE(sk->sk_peek_off) >= 0 ||
 		     unix_may_passcred(sk) ||
 		     sk->sk_scm_security)) {
-		mutex_unlock(&u->iolock);
+		unix_io_unlock(u);
 		*handled = false;
 		return 0;
 	}
 
 	{
 		struct unix_ring *ring = smp_load_acquire(&u->rx_ring);
-		u64 head, tail, avail;
+		struct unix_ring_fd_ring *fdr;
+		u64 head, fd_tail = 0, tail, orig_avail, avail;
+		bool at_fd_slot = false;
 		size_t rchunk, first, got;
 		u32 off;
 
 		if (unlikely(!ring || !ring->buf)) {
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 			*handled = false;
 			return 0;
 		}
 
 		head = smp_load_acquire(&ring->head);
+		fdr = smp_load_acquire(&ring->fd_ring);
 		if (unlikely(!skb_queue_empty_lockless(&sk->sk_receive_queue))) {
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 			*handled = false;
 			return 0;
 		}
 
 		tail = ring->tail;
-		avail = head > tail ? head - tail : 0;
+		orig_avail = head > tail ? head - tail : 0;
+		avail = orig_avail;
 		if (!avail) {
 			struct socket_wq *wq;
 			DEFINE_WAIT(wait);
 
 			if (unlikely(READ_ONCE(sk->sk_err) ||
 				     (READ_ONCE(sk->sk_shutdown) & RCV_SHUTDOWN))) {
-				mutex_unlock(&u->iolock);
+				unix_io_unlock(u);
 				*handled = false;
 				return 0;
 			}
@@ -4119,19 +5855,19 @@ retry:
 			if (timeo < 0)
 				timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
 			if (!timeo) {
-				mutex_unlock(&u->iolock);
+				unix_io_unlock(u);
 				*handled = true;
 				return -EAGAIN;
 			}
 
 			wq = rcu_dereference_protected(sk->sk_wq, 1);
 			if (unlikely(!wq || READ_ONCE(wq->fasync_list))) {
-				mutex_unlock(&u->iolock);
+				unix_io_unlock(u);
 				*handled = false;
 				return 0;
 			}
 
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 			if (signal_pending(current)) {
 				*handled = true;
 				return sock_intr_errno(timeo);
@@ -4155,6 +5891,27 @@ retry:
 			goto retry;
 		}
 
+		if (unlikely(fdr)) {
+			u64 fd_head = smp_load_acquire(&fdr->fd_head);
+
+			fd_tail = fdr->fd_tail;
+			if (fd_tail != fd_head) {
+				struct unix_ring_fd_slot *slot =
+					&fdr->slots[fd_tail & UNIX_RING_FD_MASK];
+
+				if (tail < slot->ring_seq) {
+					u64 to_slot = slot->ring_seq - tail;
+
+					if (to_slot < avail)
+						avail = to_slot;
+				} else if (tail == slot->ring_seq) {
+					if ((u64)slot->msg_len < avail)
+						avail = slot->msg_len;
+					at_fd_slot = true;
+				}
+			}
+		}
+
 		rchunk = min_t(u64, avail, size);
 		off = (u32)tail & ring->mask;
 		first = min_t(size_t, rchunk, ring->size - off);
@@ -4165,16 +5922,39 @@ retry:
 					    &msg->msg_iter);
 
 		if (unlikely(!got)) {
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 			*handled = true;
 			return -EFAULT;
 		}
 
+		if (unlikely(at_fd_slot))
+			ring_fd_count = unix_ring_pop_fd_slot(u, fdr, fd_tail,
+							      ring_fds);
+
 		smp_store_release(&ring->tail, tail + got);
 		ring->cached_head = head;
 		ring->last_rx_jiffies = jiffies;
-		unix_ring_maybe_wake_peer(sk, ring, avail, got);
-		mutex_unlock(&u->iolock);
+		unix_io_unlock(u);
+		if (likely(!ring_fd_count))
+			unix_ring_maybe_wake_peer(sk, ring, tail, orig_avail, got);
+
+		if (unlikely(msg->msg_name)) {
+			struct sock *peer = unix_peer_get(sk);
+
+			if (peer) {
+				unix_copy_addr(msg, peer);
+				BPF_CGROUP_RUN_PROG_UNIX_RECVMSG_LOCK(sk,
+								      msg->msg_name,
+								      &msg->msg_namelen);
+				sock_put(peer);
+			}
+		}
+
+		if (unlikely(ring_fd_count)) {
+			unix_ring_deliver_fds(sk, msg, ring_fds, ring_fd_count);
+			if (!unix_ring_maybe_wake_peer(sk, ring, tail, orig_avail, got))
+				unix_ring_wake_peer_write(sk);
+		}
 
 		do_cmsg = READ_ONCE(u->recvmsg_inq);
 		if (unlikely(do_cmsg | msg->msg_get_inq)) {
@@ -4210,18 +5990,25 @@ int unix_stream_recvmsg(struct socket *sock, struct msghdr *msg,
 	if (likely(size &&
 		   READ_ONCE(sk->sk_state) == TCP_ESTABLISHED &&
 		   !(flags & (MSG_OOB | MSG_PEEK | MSG_WAITALL)) &&
-		   !msg->msg_name &&
 		   READ_ONCE(sk->sk_rcvlowat) <= 1 &&
 		   READ_ONCE(sk->sk_peek_off) < 0 &&
 		   !unix_may_passcred(sk) &&
-		   !sk->sk_scm_security &&
-		   skb_queue_empty_lockless(&sk->sk_receive_queue) &&
-		   smp_load_acquire(&unix_sk(sk)->rx_ring))) {
-		bool handled;
-		int ret = unix_ring_recvmsg_fast(sock, msg, size, flags, &handled);
+		   !sk->sk_scm_security)) {
+		struct unix_sock *u = unix_sk(sk);
+		struct unix_ring *ring = smp_load_acquire(&u->rx_ring);
 
-		if (likely(handled))
-			return ret;
+		if ((flags & MSG_DONTWAIT) &&
+		    unix_stream_empty_dontwait(sk, u, ring))
+			return -EAGAIN;
+
+		if (likely(ring &&
+			   skb_queue_empty_lockless(&sk->sk_receive_queue))) {
+			bool handled;
+			int ret = unix_ring_recvmsg_fast(sock, msg, size, flags, &handled);
+
+			if (likely(handled))
+				return ret;
+		}
 	}
 	return unix_stream_read_generic(&state, true);
 }
@@ -4246,6 +6033,7 @@ static ssize_t unix_stream_splice_read(struct socket *sock,  loff_t *ppos,
 		.size = size,
 		.splice_flags = flags,
 	};
+	ssize_t ret;
 
 	if (unlikely(*ppos))
 		return -ESPIPE;
@@ -4257,7 +6045,10 @@ static ssize_t unix_stream_splice_read(struct socket *sock,  loff_t *ppos,
 	    flags & SPLICE_F_NONBLOCK)
 		state.flags = MSG_DONTWAIT;
 
-	return unix_stream_read_generic(&state, false);
+	ret = unix_stream_read_generic(&state, false);
+	if (ret == -EAGAIN && unix_stream_ring_readable(sock->sk))
+		return copy_splice_read(sock->file, ppos, pipe, size, flags);
+	return ret;
 }
 
 static int unix_shutdown(struct socket *sock, int mode)
@@ -4352,6 +6143,46 @@ long unix_outq_len(struct sock *sk)
 }
 EXPORT_SYMBOL_GPL(unix_outq_len);
 
+static long unix_outq_len_ioctl(struct sock *sk)
+{
+	long amount = sk_wmem_alloc_get(sk);
+
+	if (sk->sk_type == SOCK_STREAM) {
+		struct sock *peer = unix_peer_get(sk);
+
+		if (peer) {
+			struct unix_sock *pu = unix_sk(peer);
+			struct unix_ring *pring = smp_load_acquire(&pu->rx_ring);
+
+			if (pring && READ_ONCE(pring->buf)) {
+				u64 head = smp_load_acquire(&pring->head);
+				u64 tail = READ_ONCE(pring->tail);
+
+				if (head > tail) {
+					if (unlikely(READ_ONCE(pring->drain_until_seq) < head)) {
+						/*
+						 * Synchronize with any in-flight consumer so
+						 * either we read its updated tail now, or it
+						 * is guaranteed to observe drain_until_seq >= head
+						 * and fire EPOLLET|EPOLLOUT as the ring drains.
+						 */
+						unix_io_lock(pu);
+						head = smp_load_acquire(&pring->head);
+						tail = pring->tail;
+						if (head > tail)
+							unix_ring_raise_drain_seq(pring, head);
+						unix_io_unlock(pu);
+					}
+					if (head > tail)
+						amount += (long)(head - tail);
+				}
+			}
+			sock_put(peer);
+		}
+	}
+	return amount;
+}
+
 static int unix_open_file(struct sock *sk)
 {
 	if (!ns_capable(sock_net(sk)->user_ns, CAP_NET_ADMIN))
@@ -4374,7 +6205,7 @@ static int unix_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case SIOCOUTQ:
-		amount = unix_outq_len(sk);
+		amount = unix_outq_len_ioctl(sk);
 		err = put_user(amount, (int __user *)arg);
 		break;
 	case SIOCINQ:
@@ -4398,7 +6229,7 @@ static int unix_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 			if (sk->sk_type != SOCK_STREAM)
 				return -EOPNOTSUPP;
 
-			mutex_lock(&u->iolock);
+			unix_io_lock(u);
 
 			ring = smp_load_acquire(&u->rx_ring);
 			skb = skb_peek(&sk->sk_receive_queue);
@@ -4415,7 +6246,7 @@ static int unix_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 					answ = 1;
 			}
 
-			mutex_unlock(&u->iolock);
+			unix_io_unlock(u);
 
 			err = put_user(answ, (int __user *)arg);
 		}
@@ -4434,6 +6265,66 @@ static int unix_compat_ioctl(struct socket *sock, unsigned int cmd, unsigned lon
 	return unix_ioctl(sock, cmd, (unsigned long)compat_ptr(arg));
 }
 #endif
+
+__poll_t unix_stream_poll_nowait(struct socket *sock, __poll_t requested)
+{
+	struct sock *sk = sock->sk;
+	unsigned char state = READ_ONCE(sk->sk_state);
+	u8 shutdown = READ_ONCE(sk->sk_shutdown);
+	__poll_t mask = 0;
+
+	if (unlikely(READ_ONCE(sk->sk_err)))
+		mask |= EPOLLERR;
+	if (unlikely(shutdown == SHUTDOWN_MASK || state == TCP_CLOSE))
+		mask |= EPOLLHUP;
+	if (unlikely(shutdown & RCV_SHUTDOWN))
+		mask |= EPOLLRDHUP | EPOLLIN | EPOLLRDNORM;
+
+	if ((requested & (EPOLLIN | EPOLLRDNORM)) && !(mask & EPOLLIN)) {
+		if (unix_stream_ring_readable(sk) ||
+		    !skb_queue_empty_lockless(&sk->sk_receive_queue) ||
+		    sk_is_readable(sk))
+			mask |= EPOLLIN | EPOLLRDNORM;
+	}
+#if IS_ENABLED(CONFIG_AF_UNIX_OOB)
+	if (unlikely(READ_ONCE(unix_sk(sk)->oob_skb)))
+		mask |= EPOLLPRI;
+#endif
+
+	if (!(requested & (EPOLLWRBAND | EPOLLWRNORM | EPOLLOUT)))
+		return mask;
+
+	if (unlikely(READ_ONCE(unix_sk(sk)->tx_ring_full) &&
+		     !(shutdown & SEND_SHUTDOWN) &&
+		     state == TCP_ESTABLISHED)) {
+		struct sock *peer = unix_peer_get(sk);
+
+		if (peer) {
+			struct unix_ring *pring = smp_load_acquire(&unix_sk(peer)->rx_ring);
+
+			if (!pring || !READ_ONCE(pring->buf)) {
+				WRITE_ONCE(unix_sk(sk)->tx_ring_full, false);
+			} else {
+				u32 rsize = READ_ONCE(pring->size);
+				u64 tail = READ_ONCE(pring->tail);
+				u64 head = smp_load_acquire(&pring->head);
+				u64 used = head > tail ? head - tail : 0;
+
+				if (used <= (u64)(rsize - (rsize >> 2)))
+					WRITE_ONCE(unix_sk(sk)->tx_ring_full, false);
+			}
+			sock_put(peer);
+		} else {
+			WRITE_ONCE(unix_sk(sk)->tx_ring_full, false);
+		}
+	}
+
+	if (unix_writable(sk, state))
+		mask |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+
+	return mask;
+}
+EXPORT_SYMBOL(unix_stream_poll_nowait);
 
 __poll_t unix_poll(struct file *file, struct socket *sock, poll_table *wait)
 {
@@ -4470,6 +6361,40 @@ __poll_t unix_poll(struct file *file, struct socket *sock, poll_table *wait)
 	if ((sk->sk_type == SOCK_STREAM || sk->sk_type == SOCK_SEQPACKET) &&
 	    state == TCP_CLOSE)
 		mask |= EPOLLHUP;
+
+	/* No write status requested, avoid expensive OUT checks. */
+	if (!(poll_requested_events(wait) & (EPOLLWRBAND | EPOLLWRNORM | EPOLLOUT)))
+		return mask;
+
+	/*
+	 * Self-heal stale tx_ring_full on the cold throttled path so poll() /
+	 * epoll_wait() can never refuse EPOLLOUT when peer's ring has space.
+	 */
+	if (unlikely(sk->sk_type == SOCK_STREAM &&
+		     READ_ONCE(unix_sk(sk)->tx_ring_full) &&
+		     !(shutdown & SEND_SHUTDOWN) &&
+		     state == TCP_ESTABLISHED)) {
+		struct sock *peer = unix_peer_get(sk);
+
+		if (peer) {
+			struct unix_ring *pring = smp_load_acquire(&unix_sk(peer)->rx_ring);
+
+			if (!pring || !READ_ONCE(pring->buf)) {
+				WRITE_ONCE(unix_sk(sk)->tx_ring_full, false);
+			} else {
+				u32 rsize = READ_ONCE(pring->size);
+				u64 tail = READ_ONCE(pring->tail);
+				u64 head = smp_load_acquire(&pring->head);
+				u64 used = head > tail ? head - tail : 0;
+
+				if (used <= (u64)(rsize - (rsize >> 2)))
+					WRITE_ONCE(unix_sk(sk)->tx_ring_full, false);
+			}
+			sock_put(peer);
+		} else {
+			WRITE_ONCE(unix_sk(sk)->tx_ring_full, false);
+		}
+	}
 
 	/*
 	 * we set writable also when the other side has shut down the

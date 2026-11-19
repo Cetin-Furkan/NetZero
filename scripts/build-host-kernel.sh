@@ -1,5 +1,5 @@
 #!/bin/bash
-# Project NetZero v2 — Portable Host Kernel Builder
+# Project NetZero v3 — Portable Host Kernel Builder
 # Defaults to ARCH_MARCH=tigerlake (set ARCH_MARCH=native for AMD Zen / Intel Alder/Raptor Lake).
 # Defaults to fast localmodconfig + full audio preservation (set FULL_CONFIG=1 for all distro modules).
 set -euo pipefail
@@ -43,7 +43,7 @@ else
 fi
 
 "$SRC_DIR/scripts/config" --file "$OUT_DIR/.config" \
-    --set-str CONFIG_LOCALVERSION "-netzero-v2" \
+    --set-str CONFIG_LOCALVERSION "-netzero-v3-m3" \
     --disable CONFIG_LOCALVERSION_AUTO \
     --enable CONFIG_LTO_CLANG_NONE \
     --disable CONFIG_LTO_CLANG_THIN \
@@ -70,13 +70,13 @@ make LLVM=1 O="$OUT_DIR" olddefconfig
 
 # Keep -mno-sse/-mno-avx AFTER -march so compilers schedule for target uarch + emit BMI1/BMI2/LZCNT/POPCNT/RDPID
 # on GP registers without emitting unguarded XMM/ZMM instructions outside kernel_fpu_begin()/end().
-NZ_KCFLAGS="-O3 -march=${ARCH_MARCH} -mtune=${ARCH_MARCH} -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx"
-echo "[4/4] Compiling NetZero v2 kernel ($NZ_KCFLAGS) with $(nproc) threads..."
+NZ_KCFLAGS="-O2 -march=${ARCH_MARCH} -mtune=${ARCH_MARCH} -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx"
+echo "[4/4] Compiling NetZero v3 kernel ($NZ_KCFLAGS; surgical -O3 in NetZero hotpaths) with $(nproc) threads..."
 make LLVM=1 O="$OUT_DIR" KCFLAGS="$NZ_KCFLAGS" -j"$(nproc)" bzImage modules
 
 KREL="$(make -s LLVM=1 O="$OUT_DIR" kernelrelease)"
 echo "============================================================"
-echo "[OK] Built Project NetZero v2 host kernel: $KREL"
+echo "[OK] Built Project NetZero v3 host kernel: $KREL"
 echo "     Image: $OUT_DIR/arch/x86/boot/bzImage"
 echo "     Next : sudo $REPO_DIR/scripts/install-netzero.sh"
 echo "============================================================"

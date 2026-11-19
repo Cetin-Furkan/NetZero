@@ -15,6 +15,10 @@ CFLAGS_read_write.o += $(NZ_FS_CFLAGS)
 CFLAGS_select.o += $(NZ_FS_CFLAGS)
 CFLAGS_eventpoll.o += $(NZ_FS_CFLAGS)
 CFLAGS_file.o += $(NZ_FS_CFLAGS)
+CFLAGS_eventfd.o += $(NZ_FS_CFLAGS)
+CFLAGS_timerfd.o += $(NZ_FS_CFLAGS)
+CFLAGS_pipe.o += $(NZ_FS_CFLAGS)
+CFLAGS_pidfs.o += $(NZ_FS_CFLAGS)
 
 obj-y :=	open.o read_write.o file_table.o super.o \
 		char_dev.o stat.o exec.o pipe.o namei.o fcntl.o \

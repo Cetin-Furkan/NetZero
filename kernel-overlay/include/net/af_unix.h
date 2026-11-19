@@ -12,6 +12,8 @@
 #include <net/sock.h>
 #include <uapi/linux/un.h>
 
+struct iovec;
+
 #if IS_ENABLED(CONFIG_UNIX)
 extern const struct proto_ops unix_stream_ops;
 struct unix_sock *unix_get_socket(struct file *filp);
@@ -24,8 +26,16 @@ int unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 		       int flags);
 ssize_t unix_ring_direct_send(struct socket *sock, const void __user *ubuf,
 			      size_t len, unsigned int flags, bool *handled);
+ssize_t unix_ring_direct_sendv(struct socket *sock,
+			       const struct iovec *iov,
+			       unsigned long nr_segs,
+			       size_t total_len,
+			       unsigned int flags,
+			       bool *handled);
 ssize_t unix_ring_direct_recv(struct socket *sock, void __user *ubuf,
 			      size_t size, unsigned int flags, bool *handled);
+long unix_inq_len(struct sock *sk);
+__poll_t unix_stream_poll_nowait(struct socket *sock, __poll_t requested);
 __poll_t unix_poll(struct file *file, struct socket *sock, poll_table *wait);
 __poll_t unix_dgram_poll(struct file *file, struct socket *sock,
 			 poll_table *wait);
@@ -76,6 +86,7 @@ struct unix_sock {
 	bool			recvmsg_inq;
 	bool			scm_rights_notrunc;
 	bool			tx_ring_full;
+	atomic_t		io_fast;
 };
 
 #define unix_sk(ptr) container_of_const(ptr, struct unix_sock, sk)

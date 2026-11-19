@@ -70,6 +70,11 @@ static inline void init_poll_funcptr(poll_table *pt, poll_queue_proc qproc)
 	pt->_key   = ~(__poll_t)0; /* all events enabled */
 }
 
+static inline bool poll_does_not_wait(const poll_table *p)
+{
+	return !p || !p->_qproc;
+}
+
 static inline bool file_can_poll(struct file *file)
 {
 	return file->f_op->poll;
@@ -79,16 +84,43 @@ static inline bool file_can_poll(struct file *file)
 extern const struct file_operations socket_file_ops;
 extern __poll_t sock_poll(struct file *file, struct poll_table_struct *pt);
 #endif
+#ifdef CONFIG_EVENTFD
+extern const struct file_operations eventfd_fops;
+extern __poll_t eventfd_poll(struct file *file, struct poll_table_struct *pt);
+#endif
+extern const struct file_operations pipeanon_fops;
+extern const struct file_operations pipefifo_fops;
+extern __poll_t pipe_poll(struct file *filp, struct poll_table_struct *wait);
+#ifdef CONFIG_TIMERFD
+extern const struct file_operations timerfd_fops;
+extern __poll_t timerfd_poll(struct file *file, struct poll_table_struct *pt);
+#endif
+extern const struct file_operations pidfs_file_operations;
+extern __poll_t pidfd_poll(struct file *file, struct poll_table_struct *pt);
 
 static inline __poll_t vfs_poll(struct file *file, struct poll_table_struct *pt)
 {
+	const struct file_operations *f_op = file->f_op;
+
 #ifdef CONFIG_NET
-	if (likely(file->f_op == &socket_file_ops))
+	if (likely(f_op == &socket_file_ops))
 		return sock_poll(file, pt);
 #endif
-	if (unlikely(!file->f_op->poll))
+#ifdef CONFIG_EVENTFD
+	if (f_op == &eventfd_fops)
+		return eventfd_poll(file, pt);
+#endif
+	if (f_op == &pipeanon_fops || f_op == &pipefifo_fops)
+		return pipe_poll(file, pt);
+#ifdef CONFIG_TIMERFD
+	if (f_op == &timerfd_fops)
+		return timerfd_poll(file, pt);
+#endif
+	if (f_op == &pidfs_file_operations)
+		return pidfd_poll(file, pt);
+	if (unlikely(!f_op->poll))
 		return DEFAULT_POLLMASK;
-	return file->f_op->poll(file, pt);
+	return f_op->poll(file, pt);
 }
 
 struct poll_table_entry {

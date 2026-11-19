@@ -977,6 +977,23 @@ void tcp_rcvbuf_grow(struct sock *sk, u32 newval)
 	}
 	rcvwin += grow;
 
+	{
+		u32 min_rtt = tcp_min_rtt(tp);
+
+		/*
+		 * NetZero M3 RX Bufferbloat Moderation:
+		 * When WAN RTT inflates past 1.75x unloaded min_rtt (standing
+		 * AP/ISP downstream queue) and sk_rcvbuf already exceeds 256 KiB,
+		 * dampen window doubling so Cubic/Reno senders stop bloating the
+		 * bottleneck router while keeping >= 1.5x BDP pipe utilization.
+		 */
+		if (min_rtt >= 4000U && min_rtt != ~0U &&
+		    rtt_us > min_rtt + (min_rtt >> 1) + (min_rtt >> 2) &&
+		    READ_ONCE(sk->sk_rcvbuf) >= (256U << 10)) {
+			rcvwin = newval + (newval >> 1) + (grow >> 2);
+		}
+	}
+
 	if (!RB_EMPTY_ROOT(&tp->out_of_order_queue))
 		rcvwin += TCP_SKB_CB(tp->ooo_last_skb)->end_seq - tp->rcv_nxt;
 
